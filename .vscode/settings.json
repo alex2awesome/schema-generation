@@ -1,3 +1,7 @@
 {
-    "workbench.colorTheme": "JupyterLab Light"
+    "workbench.colorTheme": "JupyterLab Light",
+    "python.defaultInterpreterPath": "/Users/spangher/miniconda3/bin/python",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ]
 }
