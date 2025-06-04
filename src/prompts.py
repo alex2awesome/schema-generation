@@ -1,11 +1,27 @@
 # pip install -U git+https://github.com/nicholishen/tooldantic.git
-from pydantic import BaseModel, create_model, field_validator, ValidationError
+# from pydantic import BaseModel, create_model, field_validator, ValidationError
 from typing import List, Optional, Literal
 from annotated_types import Len
 from typing import ClassVar, Annotated
+from tooldantic import ToolBaseModel as BaseModel
+import tooldantic as td
 
+
+########################
+#
+# Similarity Prompts
+#
+############################
 
 GENERIC_SIMILARITY_PROMPT = """
+  I will show you {k_i} pairs of of labels, all describing some aspect of text.
+  
+  Are the two labels in each pair describing similar concepts?
+  Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
+  Answer with "Yes" or "No". Answer each in a JSON in the format:
+"""
+
+MATHEMATICAL_REASONING_SIMILARITY_PROMPT = """
   I will show you {k_i} pairs of of labels, all applied to different mathematical reasoning steps.
 
   Are the two labels in each pair describing similar reasoning steps in mathematical problem solving?
@@ -48,6 +64,180 @@ GENERIC_SIMILARITY_PROMPT = """
   Answers:
 """
 
+EMOTIONS_SIMILARITY_PROMPT = """
+I will show you {k_i} pairs of of labels, all applied to different emotions.
+
+Are the two labels in each pair describing related emotions with related impacts on the reader?
+Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
+Answer with "Yes" or "No". Answer each in a JSON in the format:
+{{
+  "pair_idx": PAIR_IDX,
+  "label": 'Yes' or 'No'
+}}
+
+<example>
+1. Label 1: "Satisfaction": The commenter feels content with their preparations. Label 2: "Polite": The commenter is trying to engage in a respectful manner.
+2. Label 1: "Disapproval": The commenter disapproves of stealing. Label 2: "Frustration": The commenter is frustrated with the judgment of others without evidence.
+3. Label 1: "Desire": The commenter expresses a strong craving or longing for the cake. Label 2: "Longing": Wishing for validation or recognition.
+4. Label 1: "Anger": The commenter expresses strong negative feelings towards the subject. Label 2: "Humor": The commenter uses humor to relate to the situation.
+  Answers:
+    [
+      {{
+      "pair_idx": 1,
+      "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 2,
+        "label": 'No'
+      }},
+      {{
+        "pair_idx": 3,
+        "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 4,
+        "label": 'No'
+      }}
+    ]
+</example>
+Now it's your turn:
+{samples_str}
+
+Answers:
+"""
+
+HATE_SPEECH_SIMILARITY_PROMPT = """
+I will show you {k_i} pairs of of labels, all applied to different reactions to hate speech.
+
+Are the two labels in each pair describing similar reactions?
+Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
+Answer with "Yes" or "No". Answer each in a JSON in the format:
+{{
+  "pair_idx": PAIR_IDX,
+  "label": 'Yes' or 'No'
+}}
+
+<example>
+1. Label 1: "Hostile": Aggressively dismissing the original comment. Label 2: "Counterargument": Challenging the original narrative with additional information.
+2. Label 1: "Skeptical": The response expresses doubt about the intentions of others. Label 2:   "Cynical": Expressing a cynical view on someone\'s experience.
+3. Label 1: "Confrontational": Challenges the original comment\'s perspective directly. Label 2: "Hostile": Aggressively dismissing the original comment.
+4. Label 1: "Critical": Judging the actions of the individual in the scenario. Label 2: "Concerned": Expressing alarm about the situation.
+  Answers:
+    [
+      {{
+      "pair_idx": 1,
+      "label": 'No'
+      }},
+      {{
+        "pair_idx": 2,
+        "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 3,
+        "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 4,
+        "label": 'No'
+      }}
+    ]
+</example>
+Now it's your turn:
+{samples_str}
+
+Answers:
+"""
+
+NEWS_DISCOURSE_SIMILARITY_PROMPT = """
+I will show you {k_i} pairs of of labels, all applied to different sentences in a news article, categorizing the discourse function of that sentence in the overall article.
+
+Are the two labels in each pair describing similar discourse purposes?
+Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
+Answer with "Yes" or "No". Answer each in a JSON in the format:
+{{
+  "pair_idx": PAIR_IDX,
+  "label": 'Yes' or 'No'
+}}
+
+<example>
+1. Label 1: "Additional Incident Report": Describes another conflict resulting in casualties among Taliban fighters. Label 2: "Supporting Detail": Offers a visual detail related to peacekeeping operations, giving more information about the environment in which these events occurred.
+2. Label 1: "Contextual Background": Provides context about the U.S. tariffs and escalation in trade tensions. Label 2: "Main Event": Introduces the main event of the article, which is China\'s imposition of a 10\% tarrif, highlighting the escalation of the trade dispute.
+3. Label 1: "Summary of Market Trends": Summarizes the overall performance of CBOT agricultural futures, linking it to weather and trade talks. Label 2: "Supply Forecast": This sentence discusses potential increases in non-OPEC oil supply, which is relevant to the overall market dynamics.
+4. Label 1: "Contextual Insight": Links rapid intensification of storms to climate change through scientific studies, highlighting its increasing seriousness. Label 2: "Human Interest": Provides a quote from an individual explaining their actions, emotions and experiences during the climate-change induced storm.
+  Answers:
+    [
+      {{
+      "pair_idx": 1,
+      "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 2,
+        "label": 'No'
+      }},
+      {{
+        "pair_idx": 3,
+        "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 4,
+        "label": 'No'
+      }}
+    ]
+</example>
+Now it's your turn:
+{samples_str}
+
+Answers:
+"""
+
+EDITORIAL_SIMILARITY_PROMPT = """
+I will show you {k_i} pairs of of labels, all applied to different sentences in an editorial or opinion article.
+
+Are the two labels in each pair describing similar argumentation strategies or are having similar effects on the reader?
+Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
+Answer with "Yes" or "No". Answer each in a JSON in the format:
+{{
+  "pair_idx": PAIR_IDX,
+  "label": 'Yes' or 'No'
+}}
+
+<example>
+1. Label 1: "Implied Urgency": This sentence conveys a sense of urgency and hope, suggesting that the right voice could fulfill a significant need in the political landscape, thereby motivating leaders to act. Label 2: "Motivational Reminder": This sentence serves as a motivational cue for the president\'s team, reinforcing the urgency and importance of their efforts in the final phase of his presidency.
+2. Label 1: "Causal Argument": This sentence argues that the restrictive policies create resentment among the Javakheti Armenians, suggesting that such animosity could be leveraged by Russia for its own strategic interests. Label 2: "Historical Context": This sentence provides historical context regarding NATO and EU expansion, framing it as a direct threat to Russia, thereby reinforcing the narrative of encirclement and vulnerability.
+3. Label 1: "Statistical Evidence": The reference to the absence of convictions since 1969 serves as a powerful statistic that underscores the ongoing issue of police impunity, reinforcing the argument for the need for reform. Label 2: "Trend Evidence": Similar to the previous sentence, this presents another trend in gun ownership, specifically regarding background checks, reinforcing the argument that more people are seeking to legally own guns.
+4. Label 1: "Minimization": The author downplays the severity of the actions of the Paris assassins, framing them as ordinary individuals rather than terrorists, which serves to diminish the perceived threat. Label 2: "Critique": Critically points out the limited nature of the official\'s engagement, suggesting a lack of genuine dialogue beyond a narrow focus on counter-terrorism.
+  Answers:
+    [
+      {{
+      "pair_idx": 1,
+      "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 2,
+        "label": 'No'
+      }},
+      {{
+        "pair_idx": 3,
+        "label": 'Yes'
+      }},
+      {{
+        "pair_idx": 4,
+        "label": 'No'
+      }}
+    ]
+</example>
+Now it's your turn:
+{samples_str}
+
+Answers:
+"""
+
+
+########################
+#
+# Initial Labeling Prompts
+#
+############################
 EDITORIAL_INITIAL_LABELING_PROMPT = """
   You will be given an editorial or opinion article as well as a sentence from that article. 
 
@@ -107,6 +297,7 @@ Return a list of {k} labels in the format:
 Your response:
 """
 
+
 NEWS_CLUSTER_LABELING_PROMPT = '''You are a helpful assistant. I will give you a list of news headlines and summaries. You will summarize them and 
 return a single, specific topic label and a description in the following forward: "Label": Description. 
 Please condense them into a single, specific label. Be precise and concise. Ignore labels that are too generic.
@@ -129,10 +320,12 @@ Now it's your turn. Here are the article headlines and summaries:
 output:
 '''
 
+
 class EditorialLabelingResponse(BaseModel):
     """Response format for single sentence editorial labeling."""
     label: str
     description: str
+
 
 class MultiSentenceLabelingItem(BaseModel):
     """Individual sentence labeling in multi-sentence response."""
@@ -140,9 +333,81 @@ class MultiSentenceLabelingItem(BaseModel):
     label: str
     description: str
 
+
 class MultiSentenceLabelingResponse(BaseModel):
     """Response format for multi-sentence editorial labeling."""
     sentences: List[MultiSentenceLabelingItem]
+
+
+SINGLE_COMMENT_EMOTION_LABELING_PROMPT = """
+  You will be given a comment extracted from Reddit. Please label all the emotions that the commenter is likely feeling and/or expressing.
+  Think broadly about what the commenter is feeling and/or expressing.
+  Think about the commenter's relationship to the topic of the comment.
+  Return a list of labels in the format: 
+  {{
+    'comment_labels': [
+      {{
+        'label': LABEL,
+        'description': DESCRIPTION
+      }},
+      ...
+    ]
+  }}
+
+  <comment>
+{comment}
+  </comment>
+
+  Your response:
+"""
+
+# Return a list of {k} labels in the format: 
+# [{{
+#   'comment_idx': COMMENT_IDX,
+#   'comment_labels': [
+#     {{
+#       'label': LABEL,
+#       'description': DESCRIPTION
+#     }},
+#     ...
+#   ]
+# }},
+# ...
+# ]
+MULTI_SENTENCE_EMOTION_LABELING_PROMPT = """
+  You will be given {k} comments extracted from Reddit. 
+  Think broadly about what the commenter is feeling and/or expressing.
+  Think about the commenter's relationship to the topic of the comment.
+  For each comment, please label the emotions that the commenter is expressing.
+
+  <comments>
+  {comments}
+  </comments>
+
+  Your response:
+"""
+
+
+class SingleCommentLabel(BaseModel):
+    """Individual comment labeling in single comment response."""
+    label: str
+    description: str
+
+
+class SingleCommentLabelingResponse(BaseModel):
+    """Response format for single comment emotion labeling."""
+    comment_labels: List[SingleCommentLabel]
+
+
+class MultiCommentLabelingItem(BaseModel):
+    """Individual comment labeling in multi-comment response."""
+    comment_idx: int
+    comment_labels: List[SingleCommentLabel]
+
+
+class MultiCommentLabelingResponse(BaseModel):
+    """Response format for multi-comment emotion labeling."""
+    comments: List[MultiCommentLabelingItem]
 
 
 class SimilarityPrompt(BaseModel):
@@ -153,19 +418,104 @@ class SimilarityPrompt(BaseModel):
     description_1: str
     description_2: str
 
+
 class SimilarityResponse(BaseModel):
     """Response format for similarity task."""
     pair_idx: int
     label: Literal['Yes', 'No']
 
+
 class MultiSimilarityResponse(BaseModel):
     """Response format for multi-sentence similarity labeling."""
     pairs: List[SimilarityResponse]
 
+
+HATE_SPEECH_LABELING_PROMPT = """
+You are a trained specialist. 
+You are tasked with analyzing {k} responses to online messages. Both the messages and the responses may contain hate speech. 
+For each response:
+
+1. Examine the Content: Carefully read the response to understand its context, tone, and intent.
+2. Identify Strategy: Note how the response relates to the original message.
+3. Generate a Label: Assign one or more descriptive labels that capture the spirit and strategy of the response, NOT it's topic.
+Be concise (1-3 words). 
+
+<messages_and_responses>
+{messages_and_responses}
+</messages_and_responses>
+
+Your response:
+"""
+
+
+class HateSpeechLabel(BaseModel):
+    """Individual hate speech labeling in single comment response."""
+    label: str
+    description: str
+
+
+class HateSpeechLabelingResponse(BaseModel):
+    """Response format for hate speech labeling."""
+    labels: List[HateSpeechLabel]
+
+
+class MultiHateSpeechLabelingItem(BaseModel):
+    """Individual hate speech labeling in multi-comment response."""
+    comment_idx: int
+    labels: List[HateSpeechLabel]
+
+
+class MultiHateSpeechLabelingResponse(BaseModel):
+    """Response format for multi-hate speech labeling."""
+    comments: List[MultiHateSpeechLabelingItem]
+
+
+NEWS_DISCOURSE_LABELING_PROMPT = """
+You are an annotator tasked with analyzing sentences in a news article. 
+I will give you the full news article and ask you to write labels for {k} sentences.
+For each sentence, decide what role it plays in the article's overall narrative and structure. 
+Your goal is to group sentences into distinct categories based on how they contribute to understanding the main story. 
+Your labels should reflect your reasoning about the function and relevance of each sentence to the article's core narrative.
+
+<article>
+{article}
+</article>
+
+Please write labels for the following sentences:
+<sentence_indices>
+{sentence_indices}
+</sentence_indices>
+
+Your response:
+"""
+
+
+class NewsDiscourseLabel(BaseModel):
+    """Individual news discourse labeling in single sentence response."""
+    label: str
+    description: str
+
+
+class NewsDiscourseLabelingResponse(BaseModel):
+    """Response format for news discourse labeling."""
+    sentences: List[NewsDiscourseLabel]
+
+
+class MultiNewsDiscourseLabelingItem(BaseModel):
+    """Individual news discourse labeling in multi-sentence response."""
+    sentence_idx: int
+    label: str
+    description: str
+
+
+class MultiNewsDiscourseLabelingResponse(BaseModel):
+    """Response format for multi-news discourse labeling."""
+    sentences: List[MultiNewsDiscourseLabelingItem]
+
+
 # Tree Generation Prompts
 # These prompts are used in create_trees.py for generating hierarchical tree structures
 # from clusters of labeled data. They help summarize and label nodes in the tree.
-
 KEYWORD_DEFINITION_NODE_PROMPT = """
 You are a helpful assistant. I will give you a list of labels I wrote. You will summarize them and 
 return a single, specific label and a description in the following forward: "Label": Description. 
@@ -262,7 +612,7 @@ class AreSummariesInTextResponse(BaseModel):
     #         raise ValueError(f'List must have between {cls.min_items} and {cls.max_items} items')
     #     return v
 
-
+from pydantic import create_model
 def make_summary_structure(min_len: int, max_len: int):
     return create_model(
         'AreSummariesInTextResponse',
@@ -270,24 +620,116 @@ def make_summary_structure(min_len: int, max_len: int):
     )
 
 
-GENERATE_SUMMARIES_PROMPT = """
-Here is a corpus of text samples, sorted from the lowest to the highest score.
+GENERATE_SUMMARIES_WITH_DESCRIPTIONS_PROMPT = """
+You are a helpful summarizer assistant.
+Here is a corpus of descriptions I wrote for datapoints, sorted from the lowest to the highest score.
+
+<high_scoring_descriptions>
+{high_scoring_input}
+</high_scoring_descriptions>
+
+<low_scoring_descriptions>
+{low_scoring_input}
+</low_scoring_descriptions>
+
+Please propose {num_candidates} different short 2-4 word summaries that summarize the descriptions with high scores as they relate to {goal}, and do NOT summarize the descriptions with lower scores.
+The summaries should be concise and specific and focus on how the descriptions relate to {goal}, not their specific topics.
+Each candidate summary should try to capture the meaning of ALL the descriptions with high scores. 
+Do not generate vague summaries that are too generic, avoid weasle words like "Techniques", "Strategies", "Approaches", etc. Be specific about the {goal} of the text samples.
+Your response is:
+"""
+
+GENERATE_SUMMARIES_WITH_DESCRIPTIONS_AND_EXAMPLES_PROMPT = """
+Here is a corpus of text samples and descriptions I wrote for them, sorted from the lowest to the highest score.
+
+<high_scoring_descriptions_and_examples>
+{high_scoring_input}
+</high_scoring_descriptions_and_examples>
+
+<low_scoring_descriptions_and_examples>
+{low_scoring_input}
+</low_scoring_descriptions_and_examples>
+
+Please propose {num_candidates} different short 2-4 word summaries that summarize the text samples with high scores as they relate to {goal}, and do NOT summarize the text samples with lower scores.
+The summaries should be concise and specific and focus on how the text samples relate to {goal}, not their specific topics.
+Each candidate summary should try to capture the meaning of ALL the text samples with high scores. 
+Do not generate vague summaries that are too generic, avoid weasle words like "Techniques", "Strategies", "Approaches", etc. Be specific about the {goal} of the text samples.
+Your response is:
+"""
+
+GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT = """
+I am summarizing an inner node in a tree. Here is a corpus of text samples, sorted from the lowest to the highest score by their similarity to the inner node.
 
 <high_scoring_examples>
-{high_scoring_examples}
+{high_scoring_input}
 </high_scoring_examples>
 
 <low_scoring_examples>
-{low_scoring_examples}
+{low_scoring_input}
 </low_scoring_examples>
 
-Please propose {num_candidates} different short 2-4 word keyword summaries that DO summarize the text samples with high scores as they relate to {goal}, and do NOT summarize the text samples with lower scores.
-The summaries should be concise and specific and focus on the meaning of the text samples as they relate to {goal}.
-Each candidate summary should try to capture the meaning of ALL the text samples with high scores. I will select the best summary from your list, so try to make each summary as good as possible. I will discard VAGUE summaries
-Your response is:
+Here are the children summaries for this inner node:
+<children_summaries>
+{children_summaries}
+</children_summaries>
+
+Here are summaries for nodes that are not children of this inner node (if you don't see any, it's okay, it just means we haven't generated any other summaries yet):
+<other_summaries>
+{other_summaries}
+</other_summaries>
+
+Please propose {num_candidates} different short 1-3 word summaries. I will select the best summary from your list.
+The summaries should consolidate the information from the children summaries and be DIFFERENT from the other summaries.
+The summaries should summarize the text samples with high scores as they relate to {goal}, and do NOT summarize the text samples with lower scores.
+The summaries should be concise and specific and focus on how the text samples relate to {goal}, not their specific topics.
+Each candidate summary should try to capture the meaning of ALL the text samples with high scores. 
+Do not generate vague summaries that are too generic, avoid weasle words like "Techniques", "Strategies", "Approaches", etc. Be specific about the {goal} of the text samples.
+Return just the summaries, no other text. Your response is:
 """
+
+
+GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT_WITH_PRIOR_LABEL = """
+I am summarizing an inner node in a tree. Here is a corpus of text samples, sorted from the lowest to the highest score by their similarity to the inner node.
+
+<high_scoring_examples>
+{high_scoring_input}
+</high_scoring_examples>
+
+<low_scoring_examples>
+{low_scoring_input}
+</low_scoring_examples>
+
+Here are the children summaries for this inner node:
+<children_summaries>
+{children_summaries}
+</children_summaries>
+
+Here are summaries for nodes that are not children of this inner node (if you don't see any, it's okay, it just means we haven't generated any other summaries yet):
+<other_summaries>
+{other_summaries}
+</other_summaries>
+
+Here is an existing summary for this inner node. 
+I made this summary before, but I want you to improve it -- make it more specific with less weasel words. 
+This label may have been based off a slightly different set of text samples than the ones I'm showing you now so please try to incorporate both sets of information.
+<prior_label>
+{prior_label_str}
+</prior_label>
+
+Please propose {num_candidates} different short 1-3 word summaries. I will select the best summary from your list.
+The summaries should consolidate the information from the children summaries and be DIFFERENT from the other summaries.
+The summaries should summarize the text samples with high scores as they relate to {goal}, and do NOT summarize the text samples with lower scores.
+The summaries should be concise and specific and focus on how the text samples relate to {goal}, not their specific topics.
+Each candidate summary should try to capture the meaning of ALL the text samples with high scores. 
+Do not generate vague summaries that are too generic, avoid weasle words like "Techniques", "Strategies", "Approaches", etc. Be specific about the {goal} of the text samples.
+Return just the summaries, no other text. Your response is:
+"""
+
 # For each summary, return a label and a description of the label.
 class GenerateSummariesResponse(BaseModel):
     """Response format for generate summaries task."""
     summaries: List[str]
-    # summaries: List[TreeNodeLabelResponse]
+
+class GenerateSummariesWithLabelsAndDescriptionsResponse(BaseModel):
+    """Response format for generate summaries task."""
+    summaries: List[TreeNodeLabelResponse]

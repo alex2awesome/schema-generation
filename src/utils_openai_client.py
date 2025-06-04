@@ -77,7 +77,13 @@ def load_model(model_name: str) -> tuple:
     return None, _openai_client
 
 
-def prompt_openai_model(prompt: str, model_name: str = "gpt-4o-mini", temperature: float = 0.1, response_format: Optional[type] = None) -> Any:
+def prompt_openai_model(
+        prompt: str, 
+        model_name: str = "gpt-4o-mini", 
+        temperature: float = 0.1, 
+        response_format: Optional[type] = None,
+        client: Any = None
+    ) -> Any:
     """
     Send a single prompt to the model and get the response.
     
@@ -90,7 +96,8 @@ def prompt_openai_model(prompt: str, model_name: str = "gpt-4o-mini", temperatur
     Returns:
         Any: The model's response (either as string or parsed structured output)
     """
-    _, client = load_model(model_name)
+    if client is None:
+        _, client = load_model(model_name)
     
     if response_format is not None:
         # Use parse method for structured output
@@ -120,7 +127,6 @@ def create_batch_files(
     debug_mode: bool = False,
     temperature: float = 0.1,
     max_tokens: int = 1024,
-    batch_type: str = "default",
     response_format: Optional[type] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -134,7 +140,6 @@ def create_batch_files(
         debug_mode: If True, keeps the batch files for inspection instead of deleting them
         temperature: Sampling temperature
         max_tokens: Maximum number of tokens to generate
-        batch_type: Type of batch being processed
         response_format: Pydantic model class for structured output
         
     Returns:
@@ -160,7 +165,9 @@ def create_batch_files(
         
         # Add response format if provided
         if response_format is not None:
-            request_body["response_format"] = type_to_response_format_param(response_format)
+            format_json = type_to_response_format_param(response_format)
+            request_body["response_format"] = format_json
+            # request_body["response_format"] = response_format.model_json_schema()
         
         batched_prompts.append({
             "custom_id": prompt_id,
@@ -173,7 +180,7 @@ def create_batch_files(
     client = OpenAI()
     batch_files = []
     
-    for i in tqdm(range(0, len(batched_prompts), batch_size), desc="Creating batch files"):
+    for i in tqdm(range(0, len(batched_prompts), batch_size), desc="Creating batch files..."):
         batch = batched_prompts[i:i + batch_size]
         filename = os.path.join(temp_dir, f'batch_{i}.jsonl')
         
@@ -213,7 +220,7 @@ def create_batches(
     client = OpenAI()
     batches = []
     
-    for batch_file in tqdm(batch_files, desc="Creating batches"):
+    for batch_file in tqdm(batch_files, desc="Creating batches..."):
         batch = client.batches.create(
             input_file_id=batch_file.id,
             endpoint="/v1/chat/completions",
@@ -268,10 +275,10 @@ def get_batch_results(batch_id: str) -> List[Dict[str, Any]]:
     return results
 
 def generate_responses(
-    client: Any,
     prompt_ids: List[str],
     prompts: List[str],
     model_name: str,
+    client: Any = None,
     temperature: float = 0.1,
     max_tokens: int = 1024,
     batch_size: int = 5000,
@@ -284,16 +291,16 @@ def generate_responses(
     Generate responses for a batch of prompts using OpenAI's batch API.
     
     Args:
-        client: OpenAI client instance
         prompt_ids: List of prompt IDs to generate responses for
         prompts: List of prompts to generate responses for
         model_name: Name of the model to use
+        client: OpenAI client instance
         temperature: Sampling temperature
         max_tokens: Maximum number of tokens to generate
         batch_size: Number of prompts per batch file
         debug_mode: If True, stops after creating batch files for inspection
         temp_dir: Directory to store temporary files (defaults to system temp dir)
-        batch_type: Type of batch being processed
+        batch_type: Type of batch being processed (what does this mean?)
         response_format: Pydantic model class for structured output
         
     Returns:
@@ -304,11 +311,11 @@ def generate_responses(
         temp_dir = os.path.join(os.getcwd(), 'temp_batches')
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Create a unique identifier for this run
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-    active_batches_file = os.path.join(temp_dir, 'active_batches.json')
-    
+    if client is None:
+        _, client = load_model(model_name)
+
     # Load existing active batches if any
+    active_batches_file = os.path.join(temp_dir, f'{batch_type}__active_batches.json')
     active_batches = {}
     logging.info(f"Checking in active batches file: {active_batches_file}")
     if os.path.exists(active_batches_file):
@@ -351,8 +358,8 @@ def generate_responses(
     
     # Launch new batches
     if batches_to_launch:
-        logging.info(f"Launching {len(batches_to_launch)} new batches")
-        # Create batch files for all new batches
+        logging.info(f"Launching {len(batches_to_launch)} new batches...")
+        logging.info(f"Creating batch files...")
         batch_files = create_batch_files(
             prompt_ids=prompt_ids,
             prompts=prompts,
@@ -362,22 +369,23 @@ def generate_responses(
             debug_mode=debug_mode,
             temperature=temperature,
             max_tokens=max_tokens,
-            batch_type=batch_type,
             response_format=response_format
         )
-        
+        logging.info(f"Batch files created")
         if debug_mode:
             return None
             
         # Create batches from the files
+        logging.info(f"Creating batches...")
         new_batches = create_batches(
             batch_files=batch_files,
             completion_window="24h"
         )
-        
+        logging.info(f"Batches created")
         # Update active batches
         for (start_idx, batch_id), batch in zip(batches_to_launch, new_batches):
             active_batches[batch_id] = str(batch.id)
+            logging.info(f"Updating active batches file...")
             with open(active_batches_file, 'w') as f:
                 json.dump(active_batches, f)
             logging.info(f"Launched new batch {batch_id}")
@@ -420,8 +428,8 @@ def generate_responses(
         # Remove completed batches
         for batch_id in completed_batches:
             del active_batches[batch_id]
-            with open(active_batches_file, 'w') as f:
-                pass
+            # with open(active_batches_file, 'w') as f:
+                # pass
                 # json.dump(active_batches, f)
 
         if active_batches:

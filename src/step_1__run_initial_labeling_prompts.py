@@ -35,7 +35,20 @@ from prompts import (
     EDITORIAL_INITIAL_LABELING_PROMPT, 
     MULTI_SENTENCE_EDITORIAL_LABELING_PROMPT,
     EditorialLabelingResponse,
-    MultiSentenceLabelingResponse
+    MultiSentenceLabelingResponse,
+    # 
+    SINGLE_COMMENT_EMOTION_LABELING_PROMPT,
+    MULTI_SENTENCE_EMOTION_LABELING_PROMPT,
+    SingleCommentLabelingResponse,
+    MultiCommentLabelingResponse,
+    #
+    HATE_SPEECH_LABELING_PROMPT,
+    HateSpeechLabelingResponse,
+    MultiHateSpeechLabelingResponse,
+    #
+    NEWS_DISCOURSE_LABELING_PROMPT,
+    NewsDiscourseLabelingResponse,
+    MultiNewsDiscourseLabelingResponse,
 )
 
 # Import VLLM only if needed
@@ -45,11 +58,6 @@ def load_vllm_dependencies():
     from transformers import AutoTokenizer
     from utils_vllm_client import load_model as load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity
     return LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity
-
-# Import OpenAI only if needed
-def load_openai_dependencies():
-    from utils_openai_client import load_model as load_openai_model, generate_responses as generate_openai_responses
-    return load_openai_model, generate_openai_responses
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(lineno)d - %(message)s",
@@ -65,6 +73,38 @@ os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
 os.environ["MKL_THREADING_LAYER"] = "GNU"
 os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+
+
+def iter_input_df(input_df, batch_size):
+    for i in range(0, len(input_df), batch_size):
+        yield input_df.iloc[i: i + batch_size]
+
+
+def save_outputs(output_fname, model_outputs):
+    """Save the outputs to a file."""
+    if model_outputs is None:  # Debug mode stopped execution
+        logging.info("Debug mode: Stopped after creating batch files")
+        return False
+
+    logging.info(f'output: {model_outputs.sample(min(10, len(model_outputs)))}')
+    model_outputs.to_json(output_fname, orient='records', lines=True)
+    return True
+
+
+def check_existing_outputs(output_fname, start_idx, end_idx):
+    """Check if we already have results for this range."""
+    if not os.path.exists(output_fname):
+        return False
+    
+    try:
+        existing_df = pd.read_json(output_fname, orient='records', lines=True)
+        if len(existing_df) >= (end_idx - start_idx):
+            logging.info(f"Found existing results in {output_fname} with {len(existing_df)} rows")
+            return True
+    except Exception as e:
+        logging.warning(f"Error reading existing file {output_fname}: {e}")
+    return False
+
 
 def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_per_prompt=8):
     if not multi_sentence:
@@ -84,6 +124,7 @@ def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_p
         prompt_df['prompt'] = (
             prompt_df.apply(lambda r: EDITORIAL_INITIAL_LABELING_PROMPT.format(article=r['doc_text'], sentence=r['sent_text']), axis=1)
         )
+        prompt_df['response_format'] = EditorialLabelingResponse
         return prompt_df
     else:
         all_responses = []
@@ -114,7 +155,118 @@ def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_p
                 sentences=r['sents_chunk']
             ), axis=1)
         )
+        prompt_df['response_format'] = MultiSentenceLabelingResponse
         return prompt_df
+    
+
+def make_labeling_prompts_emotions(input_df, multi_sentence=False, num_sents_per_prompt=8):
+    if not multi_sentence:
+        prompts = []
+        for _, row in input_df.iterrows():
+            prompts.append({
+                'index': row["id"],
+                'comment': row["text"],
+            })
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df['comment'].apply(lambda x: SINGLE_COMMENT_EMOTION_LABELING_PROMPT.format(comment=x))
+        )
+        prompt_df['response_format'] = SingleCommentLabelingResponse
+        return prompt_df
+    else:
+        prompts = []
+        for batch in iter_input_df(input_df, num_sents_per_prompt):
+            prompts.append({
+                'index': '__'.join(list(map(lambda x: str(x), batch["id"].tolist()))),
+                'comments': batch["text"].tolist(),
+            })
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df.apply(lambda r: MULTI_SENTENCE_EMOTION_LABELING_PROMPT.format(
+                k=len(r['comments']),
+                comments='\n'.join(list(map(lambda x: f'{x[0] + 1}: {x[1]}', enumerate(r['comments']))))
+            ), axis=1)
+        )
+        prompt_df['response_format'] = MultiCommentLabelingResponse
+        return prompt_df
+
+
+def make_labeling_prompts_news_discourse(input_df, multi_sentence=False, num_sents_per_prompt=8):
+    if 'id' not in input_df.columns:
+        input_df['id'] = input_df.index
+
+    if not multi_sentence:
+        prompts = []
+        for _, row in input_df.iterrows():
+            article = '\n'.join(row["sentence"])
+            for sent_idx, sent in enumerate(row["sentence"]):
+                prompts.append({
+                    'index': f'{row["id"]}__sent_idx-{sent_idx}',
+                    'article': article,
+                    'sentences': sent,
+                })
+
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df.apply(lambda x: NEWS_DISCOURSE_LABELING_PROMPT.format(k=1, article=x['article'], sentences=x['sentences']), axis=1)
+        )
+        prompt_df['response_format'] = NewsDiscourseLabelingResponse
+        return prompt_df
+    else:
+        prompts = []
+        for batch in iter_input_df(input_df, num_sents_per_prompt):
+            for _, row in batch.iterrows():
+                article = '\n'.join(list(map(lambda x: f'{x[0] + 1}: {x[1]}', enumerate(row["sentence"]))))
+                for i in range(0, len(row["sentence"]), num_sents_per_prompt):
+                    sents_chunk = list(range(i + 1, min(i + num_sents_per_prompt, len(row["sentence"])) + 1))
+                    sentence_indices = ' '.join(list(map(lambda x: str(x), sents_chunk)))
+                    prompts.append({
+                        'index': f'{row["id"]}__chunk-{i}',
+                        'article': article,
+                        'sentence_indices': sentence_indices,
+                    })
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df.apply(lambda x: NEWS_DISCOURSE_LABELING_PROMPT.format(k=len(x['sentence_indices']), article=x['article'], sentence_indices=x['sentence_indices']), axis=1)
+        )
+        prompt_df['response_format'] = MultiNewsDiscourseLabelingResponse
+        return prompt_df
+
+
+def make_labeling_prompts_hate_speech(input_df, multi_sentence=False, num_sents_per_prompt=8):
+    if not multi_sentence:
+        prompts = []
+        for _, row in input_df.iterrows():
+            prompts.append({
+                'index': f'{row["Hate_ID"]}__reply-{row["Reply_ID"]}',
+                'comment': f'Body: {row["Hate_body"]}\n\nReply: {row["Reply_body"]}',
+            })
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df['comment'].apply(lambda x: HATE_SPEECH_LABELING_PROMPT.format(k=1, messages_and_responses=x))
+        )
+        prompt_df['response_format'] = HateSpeechLabelingResponse
+        return prompt_df
+    else:
+        prompts = []
+        for batch in iter_input_df(input_df, num_sents_per_prompt):
+            indices = batch.apply(lambda x: f'{x["Hate_ID"]}_{x["Reply_ID"]}', axis=1)
+            comments = batch.apply(lambda x: f'Body: {x["Hate_body"]}\nReply: {x["Reply_body"]}', axis=1)
+            prompts.append({
+                'index': '__'.join(indices.tolist()),
+                'comments': '\n\n'.join(list(map(lambda x: f'{x[0] + 1}: {x[1]}', enumerate(comments.tolist()))))
+            })
+
+        prompt_df = pd.DataFrame(prompts)
+        prompt_df['prompt'] = (
+            prompt_df.apply(lambda r: HATE_SPEECH_LABELING_PROMPT.format(
+                k=len(r['comments']),
+                messages_and_responses=r['comments']
+            ), axis=1)
+        )
+        prompt_df['response_format'] = MultiHateSpeechLabelingResponse
+        return prompt_df
+
 
 def process_batch_vllm(model, prompts_to_run, response_format):
     """Process a batch of prompts using VLLM."""
@@ -128,10 +280,23 @@ def process_batch_vllm(model, prompts_to_run, response_format):
     model_outputs = list(map(lambda x: x.outputs[0].text, outputs))
     return inputted_prompts, model_outputs, outputs
 
-def process_all_openai(model, prompts, model_name, batch_size, debug_mode, temp_dir, num_sents_per_prompt, batch_type, response_format):
+
+def process_all_openai(
+        prompts, 
+        model_name, 
+        batch_size, 
+        debug_mode, 
+        temp_dir, 
+        num_sents_per_prompt, 
+        response_format,
+        run_id,
+        experiment, 
+):
     """Process all prompts using OpenAI's batch API."""
+    from utils_openai_client import generate_responses as generate_openai_responses
+    from utils_openai_client import prompt_openai_model as prompt_openai_model
+
     model_outputs = generate_openai_responses(
-        client=model,
         prompt_ids=prompts['index'].tolist(),
         prompts=prompts['prompt'].tolist(),
         model_name=model_name,
@@ -140,43 +305,41 @@ def process_all_openai(model, prompts, model_name, batch_size, debug_mode, temp_
         batch_size=batch_size,
         debug_mode=debug_mode,
         temp_dir=temp_dir,
-        batch_type=batch_type,
         response_format=response_format
     )
 
     output_df = pd.DataFrame(model_outputs)
     output_df = output_df.merge(prompts, left_on='custom_id', right_on='index')
-    if num_sents_per_prompt > 1:
-        output_df['response'] = output_df['response'].apply(lambda x: sorted(x['sentences'], key=lambda y: y['sentence_idx']))
-        output_df['sentences'] = output_df.apply(lambda x: list(map(lambda y: x['sentences'][y['sentence_idx']], x['response'])), axis=1)
-        output_df = output_df[['custom_id', 'sentences', 'response']]
-        full_exp_df = output_df.explode(['sentences', 'response'])
-        output_df = pd.concat([full_exp_df.reset_index(drop=True), pd.DataFrame(full_exp_df['response'].tolist())], axis=1).drop(columns=['response'])
+    output_df = postprocess_outputs(output_df, experiment, num_sents_per_prompt)
     return output_df
 
-def save_outputs(output_fname, model_outputs):
-    """Save the outputs to a file."""
-    if model_outputs is None:  # Debug mode stopped execution
-        logging.info("Debug mode: Stopped after creating batch files")
-        return False
+def postprocess_outputs(output_df, experiment, num_sents_per_prompt):
+    content_column = 'sentences' if experiment in ['editorials', 'news-discourse'] else 'comments'
+    content_id_column = 'sentence_idx' if experiment in ['editorials', 'news-discourse'] else 'comment_idx'
 
-    logging.info(f'output: {model_outputs.sample(min(10, len(model_outputs)))}')
-    model_outputs.to_json(output_fname, orient='records', lines=True)
-    return True
+    if output_df['response'].isna().sum() > 0:
+        logging.warning(f'{output_df["response"].isna().sum()} responses are missing')
+        output_df = output_df[output_df['response'].notna()]
+    if num_sents_per_prompt > 1:
+        # output_df['sentences'] = output_df.apply(lambda x: list(map(lambda y: x['response'][y['sentence_idx']], x['response'])), axis=1)
+        # full_exp_df = output_df.explode(['sentences', 'response'])
 
-def check_existing_outputs(output_fname, start_idx, end_idx):
-    """Check if we already have results for this range."""
-    if not os.path.exists(output_fname):
-        return False
-    
-    try:
-        existing_df = pd.read_json(output_fname, orient='records', lines=True)
-        if len(existing_df) >= (end_idx - start_idx):
-            logging.info(f"Found existing results in {output_fname} with {len(existing_df)} rows")
-            return True
-    except Exception as e:
-        logging.warning(f"Error reading existing file {output_fname}: {e}")
-    return False
+        output_df['sentences'] = output_df['response'].apply(lambda x: sorted(x[content_column], key=lambda y: y[content_id_column]))
+        output_df = output_df[['custom_id', 'sentences', 'response']]
+        full_exp_df = output_df.explode(['sentences'])
+        output_df = pd.concat([
+            full_exp_df[['custom_id']].reset_index(drop=True), 
+            pd.DataFrame(full_exp_df['sentences'].tolist())
+        ], axis=1)#.drop(columns=['sentences'])
+
+    if experiment in ['hate-speech', 'emotions']:
+        label_col = 'labels' if experiment == 'hate-speech' else 'comment_labels'
+        output_df = output_df.rename(columns={content_id_column: 'sentence_idx'}).loc[lambda df: df[label_col].str.len() > 0]
+        output_df = output_df.explode(label_col).loc[lambda df: df[label_col].notna()].reset_index(drop=True)
+        output_df = output_df.pipe(lambda df: pd.concat([df[['custom_id', 'sentence_idx']], pd.DataFrame(df[label_col].tolist())], axis=1))
+        output_df['label_idx'] = output_df.reset_index().groupby(['custom_id', 'sentence_idx'])['index'].rank(method='dense').astype(int)
+    return output_df
+        
 
 if __name__ == "__main__":
     import argparse
@@ -194,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_mode', action='store_true', help='Stop after creating batch files for inspection')
     parser.add_argument('--temp_dir', type=str, default=None, help='Directory to store temporary batch files')
     parser.add_argument('--num_sents_per_prompt', type=int, default=8, help='Number of sentences to process per prompt')
+    parser.add_argument('--overwrite_prompt_cache', action='store_true', help='Overwrite the prompt cache')
 
     args = parser.parse_args()
     if '.json' in args.input_data_file:
@@ -205,11 +369,26 @@ if __name__ == "__main__":
 
     # make prompts
     prompt_cache_fname = f'{args.output_file}-prompt-cache.json'
-    if os.path.exists(prompt_cache_fname):
+    if os.path.exists(prompt_cache_fname) and not args.overwrite_prompt_cache:
         prompts = pd.read_json(prompt_cache_fname, orient='records', lines=True)
+        # Convert response_format back to the appropriate class
+        if args.experiment == 'editorials':
+            prompts['response_format'] = MultiSentenceLabelingResponse if args.num_sents_per_prompt > 1 else EditorialLabelingResponse
+        elif args.experiment == 'emotions':
+            prompts['response_format'] = MultiCommentLabelingResponse if args.num_sents_per_prompt > 1 else SingleCommentLabelingResponse
+        elif args.experiment == 'hate-speech':
+            prompts['response_format'] = MultiHateSpeechLabelingResponse if args.num_sents_per_prompt > 1 else HateSpeechLabelingResponse
+        elif args.experiment == 'news-discourse':
+            prompts['response_format'] = MultiNewsDiscourseLabelingResponse if args.num_sents_per_prompt > 1 else NewsDiscourseLabelingResponse
     else:
         if args.experiment == 'editorials':
             prompts = make_labeling_prompts_editorials(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
+        elif args.experiment == 'emotions':
+            prompts = make_labeling_prompts_emotions(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
+        elif args.experiment == 'hate-speech':
+            prompts = make_labeling_prompts_hate_speech(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
+        elif args.experiment == 'news-discourse':
+            prompts = make_labeling_prompts_news_discourse(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
         else:
             raise ValueError(f'Experiment {args.experiment} not supported')
         prompts.to_json(prompt_cache_fname, orient='records', lines=True)
@@ -219,21 +398,8 @@ if __name__ == "__main__":
     if args.end_idx is None:
         args.end_idx = len(prompts)
 
-
-    # make response format
-    if args.experiment == 'editorials':
-        if args.num_sents_per_prompt > 1:
-            response_format = MultiSentenceLabelingResponse
-        else:
-            response_format = EditorialLabelingResponse
-
-    
     # load the model and dependencies based on the backend
-    if args.use_openai:
-        load_openai_model, generate_openai_responses = load_openai_dependencies()
-        tokenizer, model = load_openai_model(args.model)
-        logging.info(f'loaded OpenAI model {args.model}')
-    else:
+    if not args.use_openai:
         LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity = load_vllm_dependencies()
         tokenizer, model = load_vllm_model(args.model)
         logging.info(f'loaded VLLM model {args.model}')
@@ -263,11 +429,18 @@ if __name__ == "__main__":
         with open(output_fname, 'w') as f:
             f.write('')
 
+        content_column = 'sentences' if args.experiment != 'hate-speech' else 'comments'
+        content_id_column = 'sentence_idx' if args.experiment != 'hate-speech' else 'comment_idx'
         model_outputs = process_all_openai(
-            model, prompts_to_run, args.model, args.batch_size, args.debug_mode, args.temp_dir, 
-            args.num_sents_per_prompt,
-            f"{args.experiment}__model_{args.model.replace('/', '-')}__start-idx_{args.start_idx}__end-idx_{args.end_idx}__num-sents_{args.num_sents_per_prompt}__initial-labeling",
-            response_format
+            prompts=prompts_to_run, 
+            model_name=args.model, 
+            batch_size=args.batch_size, 
+            debug_mode=args.debug_mode, 
+            temp_dir=args.temp_dir, 
+            num_sents_per_prompt=args.num_sents_per_prompt,
+            response_format=prompts['response_format'].iloc[0],
+            experiment=args.experiment,
+            run_id=f"{args.experiment}__model_{args.model.replace('/', '-')}__start-idx_{args.start_idx}__end-idx_{args.end_idx}__num-sents_{args.num_sents_per_prompt}__initial-labeling"
         )
         
         if save_outputs(output_fname, model_outputs):
@@ -298,7 +471,7 @@ if __name__ == "__main__":
                 logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
 
 """
-python run_initial_labeling_prompts.py \
+python step_1__run_initial_labeling_prompts.py \
     --input_data_file ../data/chunks-with-problems.json.gz \
     --output_file ../data/intermediate-data/superset_labeled_data.json \
     --experiment editorials \
@@ -307,7 +480,7 @@ python run_initial_labeling_prompts.py \
     --batch_size 5
     # --model google/gemma-2-27b-it \
 
-python run_initial_labeling_prompts.py \
+python step_1__run_initial_labeling_prompts.py \
     --model meta-llama/Meta-Llama-3.1-8B-Instruct \
     --input_data_file ../experiments/editorial/editorial-discourse-input-data.csv \
     --output_file ../experiments/editorial/editorial-discourse-initial-labeling.json \
@@ -317,7 +490,7 @@ python run_initial_labeling_prompts.py \
     --batch_size 5
 
 # OpenAI  
-python run_initial_labeling_prompts.py \
+python step_1__run_initial_labeling_prompts.py \
     --model gpt-4o-mini \
     --input_data_file ../experiments/editorial/editorial-discourse-input-data.csv \
     --output_file ../experiments/editorial/editorial-discourse-initial-labeling.json \
@@ -330,16 +503,47 @@ python run_initial_labeling_prompts.py \
     --temp_dir ./debug_batches
 
 # Multi-sentence OpenAI
-python run_initial_labeling_prompts.py \
+python step_1__run_initial_labeling_prompts.py \
     --model gpt-4o-mini \
     --input_data_file ../experiments/editorial/editorial-discourse-input-data.csv \
     --output_file ../experiments/editorial/editorial-discourse-initial-labeling.json \
     --experiment editorials \
-    --start_idx 0 \
-    --end_idx 100 \
     --batch_size 5000 \
     --use_openai \
     --num_sents_per_prompt 8 \
     --debug_mode \
     --temp_dir ./debug_batches 
+
+python step_1__run_initial_labeling_prompts.py \
+    --model gpt-4o-mini \
+    --input_data_file ../experiments/emotions/data/combined_emotions.csv \
+    --output_file ../experiments/emotions/emotions-initial-labeling.json \
+    --experiment emotions \
+    --batch_size 5000 \
+    --use_openai \
+    --num_sents_per_prompt 20 \
+    --debug_mode \
+    --temp_dir ../experiments/emotions/debug_openai_batches 
+
+
+python step_1__run_initial_labeling_prompts.py \
+    --model gpt-4o-mini \
+    --input_data_file ../experiments/hate-speech/data/finegrained_reply_cleaned.csv \
+    --output_file ../experiments/hate-speech/hate-speech-initial-labeling.json \
+    --experiment hate-speech \
+    --batch_size 5000 \
+    --use_openai \
+    --num_sents_per_prompt 8 \
+    --temp_dir ../experiments/hate-speech/debug_openai_batches     
+    
+python step_1__run_initial_labeling_prompts.py \
+    --model gpt-4o-mini \
+    --input_data_file ../experiments/news-discourse/data/reparsed-newsworthiness-df.jsonl \
+    --output_file ../experiments/news-discourse/news-discourse-initial-labeling.json \
+    --experiment news-discourse \
+    --batch_size 5000 \
+    --use_openai \
+    --num_sents_per_prompt 10 \
+    --temp_dir ../experiments/news-discourse/debug_openai_batches     
+
 """

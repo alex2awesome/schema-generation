@@ -43,7 +43,15 @@ import torch
 import logging
 import itertools
 from utils_openai_client import generate_responses, load_model
-from prompts import GENERIC_SIMILARITY_PROMPT, MultiSimilarityResponse
+from prompts import (
+    MultiSimilarityResponse, 
+    EMOTIONS_SIMILARITY_PROMPT, 
+    MATHEMATICAL_REASONING_SIMILARITY_PROMPT,
+    NEWS_DISCOURSE_SIMILARITY_PROMPT,
+    EDITORIAL_SIMILARITY_PROMPT,
+    HATE_SPEECH_SIMILARITY_PROMPT,
+    GENERIC_SIMILARITY_PROMPT,
+)
 
 # Set environment variable
 logging.basicConfig(
@@ -190,7 +198,9 @@ def compute_high_similarity_pairs(
             sampled_indices = torch.randperm(num_high_sim_pairs, device=device)[:sample_size_this_batch]
             sampled_batch = batch_high_sim_pairs_gpu[sampled_indices]
             high_sim_pairs.append(sampled_batch.cpu())
-    
+            del batch_high_sim_pairs_gpu
+            torch.cuda.empty_cache()
+
     all_high_sim_pairs = torch.cat(high_sim_pairs, dim=0)
     all_high_sim_pairs = all_high_sim_pairs.numpy()
     high_sim_df = pd.DataFrame(all_high_sim_pairs, columns=['level_0', 'level_1', 'similarity'])
@@ -225,7 +235,7 @@ def create_high_similarity_samples(text_df, high_sim_sample, text_col_name='Narr
     return high_sim_pairwise_samples_to_evaluate
 
 
-def generate_prompts(high_sim_samples, prompt_template, text_keyword='Description', k=3):
+def generate_prompts(high_sim_samples, prompt_template, text_keyword='Label', k=3):
     """
     Generate prompts for the LLM based on high similarity samples.
     
@@ -312,6 +322,47 @@ def create_triplets(full_data_exp_df, max_negatives_per_positive=10, max_positiv
     return triplets
 
 
+def match_batched_vllm_results_to_prompts(all_results, all_batched_inputs):
+    """
+    Match prompts to VLLM results when each prompt is a batch of multiple queries.
+    """
+    all_merged = []
+    logging.info(f"Number of results: {len(all_results)}")
+    logging.info(f"Number of batched inputs: {len(all_batched_inputs)}")
+    
+    for i, (r, b) in enumerate(zip(all_results, all_batched_inputs)):
+        try:
+            # Parse the JSON response
+            parsed_result = json.loads(r)
+            
+            # Extract the labels from the pairs
+            if isinstance(parsed_result, dict) and 'pairs' in parsed_result:
+                sorted_pairs = sorted(parsed_result['pairs'], key=lambda x: x['pair_idx'])
+                labels = [pair['label'] for pair in sorted_pairs]
+                if len(labels) == len(b):
+                    # Create a copy of the DataFrame to avoid the SettingWithCopyWarning
+                    b_copy = b.copy()
+                    b_copy.loc[:, 'label'] = labels
+                    all_merged.append(b_copy)
+                else:
+                    logging.warning(f"Batch {i}: JSON pairs length mismatch - result: {len(labels)}, input: {len(b)}")
+                    logging.warning(f"First few result items: {labels[:3]}")
+                    logging.warning(f"First few input items: {b.head(3) if hasattr(b, 'head') else b[:3]}")
+            else:
+                logging.warning(f"Batch {i}: Expected JSON with 'pairs' key but got {type(parsed_result)}")
+                logging.warning(f"Result content: {r[:200]}...")
+        except json.JSONDecodeError as e:
+            logging.error(f"Batch {i}: Failed to parse JSON response: {str(e)}")
+            logging.error(f"Raw response: {r[:200]}...")
+
+    if not all_merged:
+        logging.error("No batches were successfully matched!")
+        return pd.DataFrame()  # Return empty DataFrame instead of raising error
+        
+    full_data_df = pd.concat(all_merged)
+    return full_data_df
+
+
 def match_batched_openai_results_to_prompts(all_results, all_batched_inputs):
     """
     Match prompts to OpenAI results when each prompt is a batch of multiple queries.
@@ -332,17 +383,68 @@ def match_batched_openai_results_to_prompts(all_results, all_batched_inputs):
     return full_data_df
 
 
+def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False):
+    if '.csv' in input_file:
+        input_df = pd.read_csv(input_file)
+    elif '.json' in input_file:
+        input_df = pd.read_json(input_file, lines=True)
+    else:
+        raise ValueError(f"Unsupported file type: {input_file}")
+    
+    if debug:
+        logging.info("Running in debug mode - limiting to 10,000 rows")
+        input_df = input_df.iloc[:10_000]
+
+    if text_col_name == 'Narrative Function':
+        logging.info("Processing Narrative Function column")
+        input_df[text_col_name] = input_df[text_col_name].str.split('\n').str.get(0).str.strip()
+    
+    if text_col_name_2:
+        logging.info(f"Combining columns {text_col_name} and {text_col_name_2}")
+        input_df['text_col'] = '"' + input_df[text_col_name] + '": ' + input_df[text_col_name_2]
+
+    return input_df
+
+
+def get_prompt_template(prompt_template):
+    # 
+    if prompt_template == 'generic':
+        return GENERIC_SIMILARITY_PROMPT
+
+    # prompt template is a file
+    if prompt_template.endswith('.txt'):
+        with open(prompt_template, 'r') as f:
+            return f.read()
+    elif prompt_template.endswith('.json'):
+        with open(prompt_template, 'r') as f:
+            return json.load(f)
+    
+    # prompt template is an experiment name
+    elif prompt_template == 'emotions':
+        return EMOTIONS_SIMILARITY_PROMPT
+    elif prompt_template == 'news_discourse':
+        return NEWS_DISCOURSE_SIMILARITY_PROMPT
+    elif prompt_template == 'editorial':
+        return EDITORIAL_SIMILARITY_PROMPT
+    elif prompt_template == 'hate_speech':
+        return HATE_SPEECH_SIMILARITY_PROMPT
+    
+    ## prompt template is a string 
+    else:
+        return prompt_template
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Process narrative function similarity.')
     parser.add_argument('--input_file', type=str, default=None, help='Input data file.')
     parser.add_argument('--output_file', type=str, default=None, help='Output file filename.')
+    parser.add_argument('--prompt_template', type=str, default='generic', help='Either a file, an experiment name, or a string literal')
     parser.add_argument('--embedding_model_name', type=str, default='all-MiniLM-L6-v2', help='SentenceTransformer model name for embeddings.')
     parser.add_argument('--use_openai', action='store_true', help='Use OpenAI instead of VLLM')
     parser.add_argument('--model_name', type=str, default="meta-llama/Meta-Llama-3.1-70B-Instruct", help='Model name for prompting an LLM.')
     parser.add_argument('--text_col_name', type=str, default=None, help='Column name to compute embeddings for.')
     parser.add_argument('--text_col_name_2', type=str, default=None, help='If there is a second text column (e.g. one column for the "Label", another for the "Description").')
-    parser.add_argument('--text_keyword_name', type=str, default='Description', help='Keyword to use in the prompt.')
+    parser.add_argument('--text_keyword_name', type=str, default='Label', help='Keyword to use in the prompt.')
     parser.add_argument('--min_sim_threshold', type=float, default=0.3, help='Similarity threshold for selecting pairs.')
     parser.add_argument('--max_sim_threshold', type=float, default=0.9, help='Similarity threshold for selecting pairs.')
     parser.add_argument('--sample_size', type=int, default=2_000_000, help='Number of sample pairs to process.')
@@ -357,33 +459,14 @@ def main():
 
     # Process source data
     logging.info(f"Loading input file: {args.input_file}")
-    if '.csv' in args.input_file:
-        input_df = pd.read_csv(args.input_file)
-    elif '.json' in args.input_file:
-        input_df = pd.read_json(args.input_file, lines=True)
-    else:
-        raise ValueError(f"Unsupported file type: {args.input_file}")
+    input_df = load_and_preprocess(args.input_file, args.text_col_name, args.text_col_name_2, args.debug)
     
     logging.info(f"Loaded {len(input_df)} rows from input file")
-    
-    if args.debug:
-        logging.info("Running in debug mode - limiting to 10,000 rows")
-        input_df = input_df.iloc[:10_000]
-
-    if args.text_col_name == 'Narrative Function':
-        logging.info("Processing Narrative Function column")
-        input_df[args.text_col_name] = input_df[args.text_col_name].str.split('\n').str.get(0).str.strip()
-
-    if args.text_col_name_2:
-        logging.info(f"Combining columns {args.text_col_name} and {args.text_col_name_2}")
-        input_df['text_col'] = '"' + input_df[args.text_col_name] + '": ' + input_df[args.text_col_name_2]
-        args.text_col_name = 'text_col'
-
 
     # Step 0: create data for training a similarity model
     # ----------------------------------------------------------------
     logging.info("Computing embeddings")
-    embeddings, idx_of_df = compute_embeddings(input_df, args.embedding_model_name, text_col_name=args.text_col_name)
+    embeddings, idx_of_df = compute_embeddings(input_df, args.embedding_model_name, text_col_name='text_col')
     if args.debug:
         embeddings = embeddings[:10_000]
         idx_of_df = idx_of_df[:10_000]
@@ -397,7 +480,7 @@ def main():
         args.sample_size,
         args.batch_size
     )
-    high_sim_samples = create_high_similarity_samples(input_df, high_sim_sample, text_col_name=args.text_col_name)
+    high_sim_samples = create_high_similarity_samples(input_df, high_sim_sample, text_col_name='text_col')
     logging.info(f"Created {len(high_sim_samples)} high similarity samples")
 
     #
@@ -406,7 +489,7 @@ def main():
     logging.info("Generating prompts for language model supervision")
     all_prompts, all_batched_inputs = generate_prompts(
         high_sim_samples, 
-        prompt_template=GENERIC_SIMILARITY_PROMPT, 
+        prompt_template=get_prompt_template(args.prompt_template), 
         text_keyword=args.text_keyword_name, 
         k=args.k
     )
@@ -418,19 +501,15 @@ def main():
 
     if args.use_openai:
         logging.info(f"Using OpenAI model: {args.model_name}")
-        # Initialize OpenAI client
-        _, client = load_model(args.model_name)
-        
         # Generate responses using OpenAI
         logging.info("Generating responses with OpenAI")
         results = generate_responses(
-            client=client,
             prompt_ids=[str(i) for i in range(len(all_prompts))],
             prompts=all_prompts,
             model_name=args.model_name,
             temperature=0.1,
             batch_size=args.batch_size,
-            debug_mode=args.debug,
+            debug_mode=False,
             temp_dir=args.temp_dir,
             batch_type="similarity",
             response_format=MultiSimilarityResponse,
@@ -444,8 +523,17 @@ def main():
         # Only import VLLM-related modules when needed
         os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
         os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
-        from utils_vllm_client import run_vllm_batch, match_batched_vllm_results_to_prompts
-        results = run_vllm_batch(all_prompts, args.model_name, include_system_prompt=not ('gemma' in args.model_name))
+        from utils_vllm_client import run_vllm_batch
+        results = run_vllm_batch(
+            all_prompts, 
+            args.model_name, 
+            include_system_prompt=not ('gemma' in args.model_name),
+            batch_size=args.batch_size,
+            debug_mode=False,
+            temp_dir=args.temp_dir,
+            batch_type="similarity",
+            response_format=MultiSimilarityResponse,
+        )
         logging.info("Matching VLLM results to prompts")
         full_data_exp_df = match_batched_vllm_results_to_prompts(results, all_batched_inputs)
 
@@ -493,4 +581,176 @@ python create_supervised_similarity_data.py \
     --text_col_name label \
     --text_col_name_2 description \
     --sample_size 500_000 \
+    
+
+    
+python src/step_2__create_supervised_similarity_data.py \
+    --input_file experiments/emotions/emotions-initial-labeling-labeling__experiment-emotions__model_gpt-4o-mini__0_26404.json \
+    --output_file experiments/emotions/vllm-similarity-data.jsonl \
+    --model_name meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --batch_size 5000 \
+    --prompt_template emotions \
+    --min_sim_threshold 0.5 \
+    --max_sim_threshold 0.9 \
+    --text_col_name label \
+    --text_col_name_2 description \
+    --sample_size 10_000 \
+    --debug \
+    --temp_dir experiments/emotions/temp_batches
+
+
+python src/step_2__create_supervised_similarity_data.py \
+    --input_file experiments/news-discourse/news-discourse-initial-labeling-labeling__experiment-news-discourse__model_gpt-4o-mini__0_2155.json \
+    --output_file experiments/news-discourse/vllm-similarity-data-more-similar.jsonl \
+    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
+    --batch_size 5000 \
+    --prompt_template news_discourse \
+    --min_sim_threshold 0.5 \
+    --max_sim_threshold 0.9 \
+    --text_col_name label \
+    --text_col_name_2 description \
+    --sample_size 200_000 \
+    --temp_dir experiments/news-discourse/temp_batches    
+
+python src/step_2__create_supervised_similarity_data.py \
+    --input_file experiments/hate-speech/hate-speech-initial-labeling-labeling__experiment-hate-speech__model_gpt-4o-mini__0_457.json \
+    --output_file experiments/hate-speech/vllm-similarity-data.jsonl \
+    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
+    --batch_size 5000 \
+    --prompt_template hate_speech \
+    --min_sim_threshold 0.3 \
+    --max_sim_threshold 0.9 \
+    --text_col_name label \
+    --text_col_name_2 description \
+    --sample_size 200_000 \
+    --temp_dir experiments/hate-speech/temp_batches    
+
+python src/step_2__create_supervised_similarity_data.py \
+    --input_file experiments/editorial/editorial-discourse-initial-labeling-labeling__experiment-editorials__model_gpt-4o-mini__0_1635.json \
+    --output_file experiments/editorial/vllm-similarity-data.jsonl \
+    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
+    --batch_size 5000 \
+    --prompt_template editorial \
+    --min_sim_threshold 0.5 \
+    --max_sim_threshold 0.9 \
+    --text_col_name label \
+    --text_col_name_2 description \
+    --sample_size 200_000 \
+    --temp_dir experiments/editorial/temp_batches    
+"""
+
+
+
+
+
+
+
+
+"""
+
+import logging
+import json
+import torch
+from vllm import LLM, SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
+from transformers import AutoTokenizer
+from prompts import MultiSimilarityResponse
+
+# Set up logging
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(lineno)d - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.INFO,
+)
+
+# Test parameters
+model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"  # Use a smaller model for testing
+test_prompt = \"""
+I will show you 2 pairs of labels.
+Are the two labels in each pair describing similar concepts?
+Answer with "Yes" or "No". Answer each in a JSON in the format:
+{
+  "pairs": [
+    {
+      "pair_idx": 1,
+      "label": "Yes" or "No"
+    },
+    {
+      "pair_idx": 2,
+      "label": "Yes" or "No"
+    }
+  ]
+}
+
+1. Label 1: "Happy" Label 2: "Joyful"
+2. Label 1: "Angry" Label 2: "Sad"
+\"""
+
+# Step 1: Set up sampling parameters
+logging.info("Step 1: Setting up sampling parameters")
+json_schema = MultiSimilarityResponse.model_json_schema()
+guided_decoding_params = GuidedDecodingParams(json=json_schema)
+sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
+logging.info(f"Sampling parameters: {sampling_params}")
+
+# Step 2: Load model and tokenizer
+logging.info("\nStep 2: Loading model and tokenizer")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = LLM(
+    model_name,
+    dtype=torch.float16,
+    tensor_parallel_size=torch.cuda.device_count(),
+    max_model_len=10_000,
+    gpu_memory_utilization=0.95,
+)
+logging.info("Model and tokenizer loaded")
+
+# Step 3: Format prompt with system message
+logging.info("\nStep 3: Formatting prompt with system message")
+prompt_dicts = [
+    {
+        "role": "system",
+        "content": "You are an experienced analyst.",
+    },
+    {
+        "role": "user",
+        "content": test_prompt,
+    },
+]
+logging.info(f"Prompt dicts: {json.dumps(prompt_dicts, indent=2)}")
+
+# Step 4: Apply chat template
+logging.info("\nStep 4: Applying chat template")
+formatted_prompt = tokenizer.apply_chat_template(prompt_dicts, tokenize=False, add_generation_prompt=True)
+logging.info(f"Formatted prompt:\n{formatted_prompt}")
+
+# Step 5: Generate response
+logging.info("\nStep 5: Generating response")
+results = model.generate([formatted_prompt], sampling_params=sampling_params)
+logging.info(f"Raw results type: {type(results)}")
+logging.info(f"Number of results: {len(results)}")
+
+# Step 6: Sort results by request ID
+logging.info("\nStep 6: Sorting results by request ID")
+sorted_results = sorted(results, key=lambda x: int(x.request_id))
+logging.info(f"Number of sorted results: {len(sorted_results)}")
+
+# Step 7: Extract text from results
+logging.info("\nStep 7: Extracting text from results")
+text_results = [x.outputs[0].text for x in sorted_results]
+logging.info(f"Text results:\n{json.dumps(text_results, indent=2)}")
+
+# Step 8: Try parsing the JSON response
+logging.info("\nStep 8: Parsing JSON response")
+try:
+    parsed_result = json.loads(text_results[0])
+    logging.info(f"Parsed result:\n{json.dumps(parsed_result, indent=2)}")
+except json.JSONDecodeError as e:
+    logging.error(f"Failed to parse JSON: {str(e)}")
+    logging.error(f"Raw response: {text_results[0]}")
+
+# Cleanup
+logging.info("\nCleaning up")
+del model
+torch.cuda.empty_cache()
 """

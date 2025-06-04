@@ -6,23 +6,17 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from networkx.drawing.nx_agraph import graphviz_layout
 from adjustText import adjust_text
-import numpy as np 
 from numpy.linalg import norm
 from sklearn.preprocessing import Normalizer
 from tqdm.auto import tqdm
-import networkx as nx
 import math
 from collections import defaultdict
+from utils_summarization import single_pass_summarize_labels_with_examples, discretize_embedding_summaries
 from typing import Dict, Any, Optional, List, Tuple, Union
 from utils_openai_client import prompt_openai_model, load_model, generate_responses
-from prompts import (
-    KEYWORD_DEFINITION_NODE_PROMPT, 
-    SINGLE_SUMMARY_NODE_PROMPT, 
-    KEYWORD_DEFINITION_NODE_PROMPT_WITH_EXAMPLES,
-    TreeNodeLabelResponse
-)
+from prompts import TreeNodeLabelResponse
+from tooldantic import ToolBaseModel as BaseModel
 
-from utils_summarization import single_pass_summarize_labels_with_examples
 
 def get_root(G):
     """
@@ -34,27 +28,110 @@ def get_root(G):
             return node
     raise ValueError("No root found in the graph.")
 
-def compute_subtree_sizes(G, node, leaf_node_counts, count_attr='subtree_size', recount=False):
+
+def compute_subtree_sizes_and_membership(
+        G, 
+        node, 
+        leaf_node_counts=None, 
+        count_attr='subtree_size', 
+        leaf_node_ids_attr='leaf_node_ids', 
+        recount=False, 
+        examples_df=None, 
+        cluster_col='cluster',
+        max_depth=13
+):
     """
     Recursively computes the total number of datapoints in the subtree
     rooted at 'node' and stores it as an attribute 'subtree_size'.
     
-    For a leaf node, it uses the node's 'count' attribute (default 0 if missing).
+    Parameters:
+    -----------
+    G : networkx.DiGraph
+        The tree graph
+    node : int
+        The current node being processed
+    leaf_node_counts : dict, optional
+        Dictionary mapping leaf node IDs to their respective counts. If not provided,
+        it will be computed from examples_df if available, otherwise defaults to 1 per leaf.
+    count_attr : str, default='subtree_size'
+        Name of the attribute to store the subtree size
+    leaf_node_ids_attr : str, default='leaf_node_ids'
+        Name of the attribute to store the list of original leaf node IDs
+    recount : bool, default=False
+        Whether to recompute sizes even if they already exist
+    examples_df : pandas.DataFrame, optional
+        DataFrame containing original datapoints with cluster assignments
+    cluster_col : str, default='cluster'
+        Column name in examples_df that contains cluster IDs
+    max_depth : int, default=13
+        Maximum depth of the tree to be considered during pruning
+    Returns:
+    --------
+    tuple
+        (subtree_size, list_of_leaf_node_ids)
     """
+    # If this is the first call (at root), prepare the cluster mappings if examples_df is provided
+    if examples_df is not None and leaf_node_counts is None:
+        # Create the cluster_sizes and cluster_to_datapoints mappings
+        leaf_node_counts = examples_df[cluster_col].value_counts().to_dict()
+        # We don't need to reset_index if this is the first call
+        if 'datapoint_indices' not in G.nodes[node]:
+            # Create a mapping from clusters to datapoint indices
+            cluster_to_datapoints = examples_df.reset_index().groupby(cluster_col)['index'].apply(list).to_dict()
+            
+            # Store this mapping in leaf nodes
+            for n in G.nodes():
+                if G.out_degree(n) == 0:  # Leaf node
+                    orig_leaf_id = G.nodes[n].get('orig_leaf_node_id')
+                    if orig_leaf_id is not None and orig_leaf_id in cluster_to_datapoints:
+                        G.nodes[n]['datapoint_indices'] = cluster_to_datapoints[orig_leaf_id]
+    
+    # Set default leaf node counts if not provided
+    if leaf_node_counts is None:
+        leaf_node_counts = {k: 1 for k in range(len([n for n in G.nodes() if G.out_degree(n) == 0]))}
+    
     if (recount) or (count_attr not in G.nodes[node]):
         # leaf node
         if G.out_degree(node) == 0:
-            orig_node_id = G.nodes[node]['orig_node_id']
-            size = leaf_node_counts[int(orig_node_id)]
+            orig_leaf_node_id = G.nodes[node].get('orig_leaf_node_id')
+            if orig_leaf_node_id is not None:
+                # If we have leaf_node_counts, use it for the size
+                size = leaf_node_counts.get(int(orig_leaf_node_id), 1)
+            else:
+                size = 1  # Default size if no mapping is available
+                
             G.nodes[node][count_attr] = size
-            return size
+            return size, [orig_leaf_node_id]
     
         # For inner nodes, sum the sizes of all children
         size = 0
+        leaf_node_ids = []
+        datapoint_indices = []
+        
         for child in G.successors(node):
-            size += compute_subtree_sizes(G, child, leaf_node_counts, count_attr)
+            child_size, child_leaf_node_ids = compute_subtree_sizes_and_membership(
+                G, child, leaf_node_counts, count_attr, leaf_node_ids_attr, recount, examples_df, cluster_col
+            )
+            size += child_size
+            leaf_node_ids.extend(child_leaf_node_ids)
+            
+            # Collect datapoint indices from children if available
+            if 'datapoint_indices' in G.nodes[child]:
+                datapoint_indices.extend(G.nodes[child]['datapoint_indices'])
+        
         G.nodes[node][count_attr] = size
-    return G.nodes[node][count_attr]
+        G.nodes[node][leaf_node_ids_attr] = list(set(leaf_node_ids))
+        
+        # Store unique datapoint indices if any were collected
+        if datapoint_indices:
+            G.nodes[node]['datapoint_indices'] = list(set(datapoint_indices))
+            
+        # Add size attribute for sampling during labeling
+        if 'size' not in G.nodes[node]:
+            G.nodes[node]['size'] = len(G.nodes[node][leaf_node_ids_attr])
+            
+    return G.nodes[node][count_attr], G.nodes[node][leaf_node_ids_attr]
+
 
 # Prune the tree to include nodes with more than 5 descendants in their entire subtree
 def prune_tree_by_subtree_size(G, min_descendants=5, max_depth=8):
@@ -68,6 +145,8 @@ def prune_tree_by_subtree_size(G, min_descendants=5, max_depth=8):
         The input tree graph.
     min_descendants : int
         Minimum number of descendants required for a node to be kept.
+    max_depth : int
+        Maximum depth of the tree to be considered during pruning.
 
     Returns:
     --------
@@ -85,6 +164,7 @@ def prune_tree_by_subtree_size(G, min_descendants=5, max_depth=8):
     # Create a subgraph with only the nodes that meet the criteria
     pruned_G = G.subgraph(keep_nodes).copy()
     return pruned_G
+
 
 def save_hierarchical_tree(G, output_path, format='gml'):
     """
@@ -119,137 +199,28 @@ def load_hierarchical_tree(input_path):
         raise ValueError(f"Unsupported format: {input_path}")
 
 
-def label_node_with_discretization(
-    node: int,
-    tree,
-    examples_dataframe,
-    text_embeddings,
-    combined_cluster_texts,
-    num_candidates=5,
-    num_samples_for_generation=20,
-    num_samples_for_scoring=100,
-    goal="determine the common theme or purpose",
-    verbose=False
-):
-    """
-    Labels a node using the discretization approach that uses vector embeddings.
-    
-    Parameters:
-    -----------
-    node : int
-        The ID of the node to label
-    tree : networkx.DiGraph
-        The hierarchical tree
-    examples_dataframe : pd.DataFrame
-        Dataframe with examples indexed by cluster ID
-    text_embeddings : numpy.ndarray
-        Embeddings for the texts in combined_cluster_texts
-    combined_cluster_texts : list
-        List of texts (typically label+description pairs) for the cluster centers
-    num_candidates : int
-        Number of candidate labels to generate
-    num_samples_for_generation : int
-        Number of samples to use for candidate generation
-    num_samples_for_scoring : int
-        Number of samples to use for scoring candidates
-    goal : str
-        The goal or purpose for the discretization
-        
-    Returns:
-    --------
-    TreeNodeLabelResponse
-        The label and description for the node
-    """
-    from utils_summarization import discretize_embedding_summaries
-    from prompts import TreeNodeLabelResponse
-    
-    # Get all leaf descendants that have orig_node_id
-    leaf_nodes = list(filter(lambda x: tree.out_degree(x) == 0, nx.descendants(tree, node)))
-    leaf_node_ids = []
-    for leaf_node in leaf_nodes:
-        orig_node_id = tree.nodes[leaf_node].get('orig_node_id')
-        if orig_node_id is not None:
-            leaf_node_ids.append(orig_node_id)
-    
-    if not leaf_node_ids:
-        print(f"Warning: No leaf nodes with orig_node_id found for node {node}")
-        # Fall back to regular summarization
-        from utils_summarization import single_pass_summarize_labels_with_examples
-        return single_pass_summarize_labels_with_examples(
-            node=node,
-            example_df=examples_dataframe,
-            tree=tree,
-            num_samples_to_label=10,
-            num_examples_per_node=5,
-            sentence_col='sentences'
-        )
-    
-    # Calculate the average embedding for the node
-    node_embeddings = text_embeddings[leaf_node_ids]
-    phi_tilde = node_embeddings.mean(axis=0)
-    phi_tilde = phi_tilde / np.linalg.norm(phi_tilde)
-    
-    # Get top candidates using discretization
-    input_texts = examples_dataframe.apply(lambda x: f"{x['label']}: {x['description']}", axis=1).tolist()
-    top_candidates = discretize_embedding_summaries(
-        phi_tilde=phi_tilde,
-        X=input_texts,
-        text_embeddings=text_embeddings,
-        M=1,  # Just get the top one,
-        num_candidates=num_candidates,
-        num_samples_for_candidate_generation=num_samples_for_generation,
-        num_samples_for_scoring=num_samples_for_scoring,
-        goal=goal,
-        verbose=verbose
-    )
-    
-    if not top_candidates:
-        print(f"Warning: No candidates generated for node {node}")
-        # Fall back to regular summarization
-        from utils_summarization import single_pass_summarize_labels_with_examples
-        return single_pass_summarize_labels_with_examples(
-            node=node,
-            example_df=examples_dataframe,
-            tree=tree,
-            num_samples_to_label=10,
-            num_examples_per_node=5,
-            sentence_col='sentences'
-        )
-    
-    # Parse the top candidate
-    top_candidate = top_candidates[0]
-    if isinstance(top_candidate, dict) and 'label' in top_candidate and 'description' in top_candidate:
-        return TreeNodeLabelResponse(
-            label=top_candidate['label'],
-            description=top_candidate['description']
-        )
-    elif isinstance(top_candidate, str) and ':' in top_candidate:
-        # If it's a string in format "label: description"
-        parts = top_candidate.split(':', 1)
-        return TreeNodeLabelResponse(
-            label=parts[0].strip('"\'').strip(),
-            description=parts[1].strip()
-        )
-    else:
-        # Just use the whole thing as the label
-        return TreeNodeLabelResponse(
-            label=str(top_candidate),
-            description="Generated using embedding discretization"
-        )
-
-
 def label_hierarchical_tree(
         G, 
         leaf_node_counts=None,
-        min_descendants=1,
-        max_depth=13,
         num_samples_to_label=10,
         examples_dataframe=None,
         examples_metadata=None,
         use_discretization=False,
         text_embeddings=None,
         combined_cluster_texts=None,
-        discretization_goal="determine the common theme or purpose"
+        discretization_goal="determine the common theme or purpose",
+        use_labels_and_descriptions=False,
+        use_descriptions_and_examples=True,
+        use_child_nodes=True,
+        output_labels_and_descriptions=False,
+        num_iterations_to_run_labeling=2,
+        labeling_model='gpt-4o-mini',
+        checking_model='gpt-4o-mini',
+        # discretization parameters
+        batch_size=30,
+        num_summary_candidates_to_generate=10,
+        num_datapoints_to_use_for_scoring=300,
+        num_leaf_samples_to_use_for_generation=30
 ):
     """
     Labels a hierarchical tree based on specified criteria.
@@ -279,6 +250,20 @@ def label_hierarchical_tree(
         List of texts (typically label+description pairs) for the cluster centers.
     discretization_goal : str, optional
         The goal or purpose for the discretization. Defaults to "determine the common theme or purpose".
+    use_labels_and_descriptions : bool, optional
+        Whether to use labels and descriptions for summary generation. Defaults to False.
+    use_descriptions_and_examples : bool, optional
+        Whether to use descriptions and examples for summary generation. Defaults to True.
+    use_child_nodes : bool, optional
+        Whether to use child nodes for summary generation. Defaults to True.
+    output_labels_and_descriptions : bool, optional
+        Whether to output labels and descriptions for each node. Defaults to False.
+    num_iterations_to_run_labeling : int, optional
+        Number of iterations to run labeling for discretization. The `use_child_nodes` variant of discretization uses the rest of the tree to generate summaries, we might see improvements as the tree improves. Defaults to 2.
+    labeling_model : str, optional
+        The model to use for labeling. Defaults to 'gpt-4o-mini'.
+    checking_model : str, optional
+        The model to use for checking the labeling (only relevant if use_discretization is True). Defaults to 'gpt-4o-mini'.
 
     Returns:    
     --------
@@ -289,67 +274,109 @@ def label_hierarchical_tree(
     inner_node_label_dict : dict
         Dictionary mapping inner node IDs to their labels.
     """
-    
     # Validate parameters for discretization
     if use_discretization:
         if text_embeddings is None or examples_dataframe is None:
             raise ValueError("text_embeddings and examples_dataframe must be provided when use_discretization is True")
             
-    # extract and process tree
-    root_node = get_root(G)
-
-    # compute subtree sizes
-    if leaf_node_counts is None:
-        leaf_node_counts = {k: 1 for k in G.nodes()}
-        
-    compute_subtree_sizes(G, root_node, leaf_node_counts)
-    
-    # prune the graph and label inner tree
-    pruned_G = prune_tree_by_subtree_size(G, min_descendants=min_descendants, max_depth=max_depth)
-    inner_nodes = list(filter(lambda x: G.out_degree(x) > 0, nx.topological_sort(G)))
-    inner_nodes = list(reversed(inner_nodes))
-    inner_node_label_dict = {}
+    nodes = list(reversed(list(nx.topological_sort(G))))
+    node_label_dict = {}
     
     # Prepare examples map if not provided
-    examples_dataframe = examples_dataframe.set_index(examples_metadata['cluster_col'])
+    if examples_dataframe is not None and examples_metadata is not None and examples_metadata.get('cluster_col') in examples_dataframe.columns:
+        examples_dataframe = examples_dataframe.set_index(examples_metadata['cluster_col'])
+    else:
+        # If examples_dataframe is None, or cluster_col is missing, we can't use examples for labeling.
+        # Set examples_dataframe to None to ensure downstream code handles this.
+        # We might also want to disable features that require examples here if they are critical.
+        examples_dataframe = None # Ensure it's None if conditions aren't met
+        print("Warning: Examples dataframe is not valid or cluster column is missing. Examples will not be used for labeling.")
+
+    num_iterations_to_run_labeling = 1 if (not use_discretization and not use_child_nodes) else num_iterations_to_run_labeling
+    for i in range(num_iterations_to_run_labeling):
+        for p in tqdm(nodes, desc=f"Labeling nodes, iteration {i + 1} of {num_iterations_to_run_labeling}..."):
+            if use_discretization and 'datapoint_indices' in G.nodes[p]:
+                datapoint_indices = G.nodes[p]['datapoint_indices']
+                if datapoint_indices and len(datapoint_indices) > 0:
+                    print(f"Node {p} has {len(datapoint_indices)} direct datapoint indices")
+                    
+                    node_embeddings = text_embeddings[datapoint_indices]
+                    phi_tilde = node_embeddings.mean(axis=0)
+                    
+                    # Use this embedding for discretization
+                    top_candidates = discretize_embedding_summaries(
+                        tree=G,
+                        node=p,
+                        phi_tilde=phi_tilde,
+                        examples_df=examples_dataframe,
+                        description_embeddings=text_embeddings,
+                        M=1,  # Just get the top one
+                        num_summary_candidates_to_generate=num_summary_candidates_to_generate,
+                        num_leaf_samples_to_use_for_generation=num_leaf_samples_to_use_for_generation,
+                        num_datapoints_to_use_for_scoring=num_datapoints_to_use_for_scoring,
+                        # experimental variations
+                        use_labels_and_descriptions=use_labels_and_descriptions,
+                        use_descriptions_and_examples=use_descriptions_and_examples,
+                        use_child_nodes=use_child_nodes,
+                        output_labels_and_descriptions=output_labels_and_descriptions,
+                        goal=discretization_goal,
+                        verbose=True,
+                        checking_model=checking_model,
+                        labeling_model=labeling_model
+                    )
+                    
+                    if top_candidates and len(top_candidates) > 0:
+                        # Parse the top candidate
+                        top_candidate = top_candidates[0]
+                        if isinstance(top_candidate, dict) and 'label' in top_candidate and 'description' in top_candidate:
+                            definition_response = TreeNodeLabelResponse(
+                                label=top_candidate['label'],
+                                description=top_candidate['description']
+                            )
+                        elif isinstance(top_candidate, str) and ':' in top_candidate:
+                            # If it's a string in format "label: description"
+                            parts = top_candidate.split(':', 1)
+                            definition_response = TreeNodeLabelResponse(
+                                label=parts[0].strip('"\'').strip(),
+                                description=parts[1].strip()
+                            )
+                        else:
+                            # Just use the whole thing as the label
+                            definition_response = TreeNodeLabelResponse(
+                                label=str(top_candidate),
+                                description=None
+                            )
+                    else:
+                        print(f"Warning: No top candidates found for node {p}")
+                        definition_response = TreeNodeLabelResponse(label=f"Node {p} - No Candidates", description="Label generated without candidates.")
+
+            else:
+                # Check if examples_dataframe is available before calling a function that requires it
+                if examples_dataframe is not None and examples_metadata is not None:
+                    definition_response = single_pass_summarize_labels_with_examples(
+                        node=p,
+                        example_df=examples_dataframe,
+                        tree=G,
+                        num_samples_to_label=num_samples_to_label,
+                        num_examples_per_node=examples_metadata['num_examples_per_node'],
+                        sentence_col=examples_metadata['sentence_col']
+                    )
+                else:
+                    print(f"Warning: Examples not available for node {p}. Using basic label summarization.")
+                    definition_response = TreeNodeLabelResponse(label=f"Node {p} - No Examples", description="Label generated without examples.")
+
+            # Set attributes on the nodes - store both label and description
+            nx.set_node_attributes(G, {p: definition_response.label}, 'label')
+            if definition_response.description is not None:
+                nx.set_node_attributes(G, {p: definition_response.description}, 'description')
+            
+            # Store in the dictionary for return
+            node_label_dict[p] = {
+                'label': definition_response.label,
+                'description': definition_response.description
+            }
     
-    for p in tqdm(inner_nodes):
-        if use_discretization:
-            definition_response = label_node_with_discretization(
-                node=p,
-                tree=G,
-                examples_dataframe=examples_dataframe,
-                text_embeddings=text_embeddings,
-                combined_cluster_texts=combined_cluster_texts,
-                goal=discretization_goal,
-                verbose=True
-            )
-        else:
-            definition_response = single_pass_summarize_labels_with_examples(
-                node=p,
-                example_df=examples_dataframe,
-                tree=G,
-                num_samples_to_label=num_samples_to_label,
-                num_examples_per_node=examples_metadata['num_examples_per_node'],
-                sentence_col=examples_metadata['sentence_col']
-            )
-        
-        # Set attributes on the nodes - store both label and description
-        nx.set_node_attributes(G, {p: definition_response.label}, 'label')
-        nx.set_node_attributes(G, {p: definition_response.description}, 'description')
-        
-        # For the pruned graph, store the same attributes
-        if p in pruned_G:
-            nx.set_node_attributes(pruned_G, {p: definition_response.label}, 'label')
-            nx.set_node_attributes(pruned_G, {p: definition_response.description}, 'description')
-        
-        # Store in the dictionary for return
-        inner_node_label_dict[p] = {
-            'label': definition_response.label,
-            'description': definition_response.description
-        }
-    
-    return G, pruned_G, inner_node_label_dict
+    return G, node_label_dict
 
 
 def plot_graph(
@@ -363,7 +390,9 @@ def plot_graph(
         node_max_size=50,
         node_min_size=5,
         node_size_log_base=2,
-        font_size=12
+        font_size=12,
+        adjust_text_on_labels=True,
+        adjust_text_force_static=(0.1, 0.5)
 ):
     """
     Visualize a graph with custom formatting options.
@@ -422,7 +451,8 @@ def plot_graph(
         font_size=font_size
     )
     texts = list(ax.texts)
-    adjust_text(texts, force_static=(0.1, 0.5))
+    if adjust_text_on_labels:
+        adjust_text(texts, force_static=adjust_text_force_static)
     plt.show()
 
 
@@ -432,13 +462,13 @@ def get_leaf_to_datapoints(G, initial_kmeans_df):
     the original kmeans 1024 clusters.
     """
     # get a mapping from the original node ids to the tree node ids
-    tree_node_to_orig_node_id = nx.get_node_attributes(G, 'orig_node_id')
-    orig_node_id_to_tree_node = {v:k for k,v in tree_node_to_orig_node_id.items()}
+    tree_node_to_orig_leaf_node_id = nx.get_node_attributes(G, 'orig_leaf_node_id')
+    orig_leaf_node_id_to_tree_node = {v:k for k,v in tree_node_to_orig_leaf_node_id.items()}
 
     # get a mapping from the leaf nodes to the datapoint ids
-    leaf_to_datapoints = initial_kmeans_df['cluster'].map(orig_node_id_to_tree_node).reset_index().groupby('cluster')['index'].aggregate(list)
+    leaf_to_datapoints = initial_kmeans_df['cluster'].map(orig_leaf_node_id_to_tree_node).reset_index().groupby('cluster')['index'].aggregate(list)
     leaf_to_datapoints = leaf_to_datapoints.to_dict()
-    return leaf_to_datapoints, orig_node_id_to_tree_node, tree_node_to_orig_node_id
+    return leaf_to_datapoints, orig_leaf_node_id_to_tree_node, tree_node_to_orig_leaf_node_id
 
 
 def assign_leaves_to_cut(G, cut, leaf_to_datapoints=None, initial_kmeans_df=None):
@@ -473,13 +503,13 @@ def assign_by_threshold(G, root=None, leaf_to_datapoints=None, initial_kmeans_df
     
     # 2) Build leaf_to_datapoints if not provided
     if leaf_to_datapoints is None:
-        leaf_to_datapoints, orig_node_id_to_tree_node, tree_node_to_orig_node_id = get_leaf_to_datapoints(G, initial_kmeans_df)
+        leaf_to_datapoints, orig_leaf_node_id_to_tree_node, tree_node_to_orig_leaf_node_id = get_leaf_to_datapoints(G, initial_kmeans_df)
     
     # 3) Compute subtree sizes if missing
     if 'subtree_size' not in G.nodes[root]:
         if leaf_counts is None:
             leaf_counts = {leaf: len(pts) for leaf, pts in leaf_to_datapoints.items()}
-        compute_subtree_sizes(G, root, leaf_counts)
+        compute_subtree_sizes_and_membership(G, root, leaf_counts)
     
     # 4) Determine threshold
     total = G.nodes[root]['subtree_size']

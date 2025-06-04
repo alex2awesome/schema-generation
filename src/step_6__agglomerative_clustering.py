@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # agglomerative_clustering.py - Focused on hierarchical clustering only
 
 import sys
@@ -14,9 +14,15 @@ from sklearn.metrics import silhouette_score
 from sklearn.cluster import AgglomerativeClustering
 import matplotlib.pyplot as plt
 from pathlib import Path
-
-# Import tree utility functions
-from utils_trees import label_hierarchical_tree, plot_graph, save_hierarchical_tree
+from utils_trees import (
+    save_hierarchical_tree, 
+    plot_graph, 
+    label_hierarchical_tree, 
+    prune_tree_by_subtree_size, 
+    get_root,
+    compute_subtree_sizes_and_membership
+)
+from itertools import product
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 warnings.simplefilter(action='ignore')
@@ -161,22 +167,13 @@ def optimal_hierarchical_cuts_dp(embeddings, min_clusters=2, max_clusters=None,
     # Get corresponding thresholds
     optimal_thresholds = [cluster_map[c][0] for c in optimal_cluster_counts]
     optimal_scores = [scores[c] for c in optimal_cluster_counts]
-    
-    # Create the hierarchical tree
-    tree, cluster_node_ids = create_hierarchical_tree(embeddings, linkage_matrix, n_samples, optimal_thresholds, model)
-    
-    # Visualization (same as original function)
-    if verbose:
-        # [visualization code as in the original function]
-        pass
-    
+        
     return {
         'optimal_thresholds': optimal_thresholds,
         'silhouette_scores': optimal_scores,
         'n_clusters': optimal_cluster_counts,
         'linkage_matrix': linkage_matrix,
-        'tree': tree,
-        'cluster_node_ids': cluster_node_ids
+        'model': model
     }
 
 
@@ -188,7 +185,8 @@ def optimal_hierarchical_cuts(
     method='ward', 
     metric='euclidean',
     n_samples=None, 
-    verbose=True
+    verbose=True,
+    min_hierarchical_levels=1  # New parameter for minimum depth
 ):
     """
     Find optimal hierarchical clustering cut distances using silhouette analysis.
@@ -211,6 +209,8 @@ def optimal_hierarchical_cuts(
         Number of samples in the data. If None, uses embeddings.shape[0]
     verbose : bool, default=True
         Whether to print progress and plot results
+    min_hierarchical_levels : int, default=1
+        Minimum number of hierarchical levels to attempt to find.
         
     Returns:
     --------
@@ -220,7 +220,7 @@ def optimal_hierarchical_cuts(
         - 'silhouette_scores': silhouette scores at each level
         - 'n_clusters': number of clusters at each level
         - 'linkage_matrix': the hierarchical clustering linkage matrix
-        - 'tree': a networkx DiGraph representing the hierarchical tree
+        - 'model': the fitted AgglomerativeClustering model
     """
     if n_samples is None:
         n_samples = embeddings.shape[0]
@@ -252,6 +252,9 @@ def optimal_hierarchical_cuts(
         print("Evaluating silhouette scores across distances...")
     
     # Evaluate silhouette score for each possible threshold
+    # Store unique (distance, n_clusters) to avoid issues if multiple distances yield same n_clusters
+    evaluated_configs = {} 
+
     for i, dist in enumerate(distances):
         labels = fcluster(linkage_matrix, dist, criterion='distance')
         unique_labels = np.unique(labels)
@@ -273,43 +276,167 @@ def optimal_hierarchical_cuts(
             
         # Calculate silhouette score
         try:
-            score = silhouette_score(embeddings, labels)
-            all_scores.append(score)
-            all_distances.append(dist)
-            all_n_clusters.append(n_clusters)
+            # Use (n_clusters, dist) as key to prioritize by n_clusters then by dist if scores are same
+            # This is to ensure we only store one entry per n_cluster if multiple distances give it
+            # We prefer the largest distance (coarsest cut) that gives this n_cluster.
+            # Since 'distances' is sorted reverse (large to small), the first one we see is good.
+            config_key = n_clusters 
             
-            if verbose and i % 10 == 0:
-                print(f"Distance {dist:.4f}, Clusters: {n_clusters}, Silhouette: {score:.4f}")
+            if config_key not in evaluated_configs:
+                score = silhouette_score(embeddings, labels)
+                evaluated_configs[config_key] = {'dist': dist, 'score': score, 'n_clusters': n_clusters}
+                
+                if verbose and i % 10 == 0: # Keep some progress print
+                    print(f"Distance {dist:.4f}, Clusters: {n_clusters}, Silhouette: {score:.4f} (Candidate)")
         except:
             # This can happen if we have only one cluster or each point is its own cluster
             continue
-    
-    if len(all_scores) == 0:
+
+    if not evaluated_configs:
         raise ValueError("No valid clusterings found. Try adjusting parameters.")
+
+    # Convert evaluated_configs dict to lists for processing
+    # Sort by n_clusters to make it easier to find next levels consistently
+    sorted_configs = sorted(evaluated_configs.values(), key=lambda x: x['n_clusters'])
+
+    all_scores = np.array([cfg['score'] for cfg in sorted_configs])
+    all_distances = np.array([cfg['dist'] for cfg in sorted_configs])
+    all_n_clusters = np.array([cfg['n_clusters'] for cfg in sorted_configs])
+
+    # Data structure to manage all available cuts and their usage
+    all_cuts_info = []
+    for i in range(len(all_scores)):
+        all_cuts_info.append({
+            'id': i, # Index in all_scores/all_distances/all_n_clusters
+            'dist': all_distances[i],
+            'n_clusters': all_n_clusters[i],
+            'score': all_scores[i],
+            'used': False
+        })
         
-    # Convert to numpy arrays for easier manipulation
-    all_scores = np.array(all_scores)
-    all_distances = np.array(all_distances)
-    all_n_clusters = np.array(all_n_clusters)
-    
-    # Find optimal thresholds using a hierarchical approach
-    optimal_thresholds = []
-    remaining_indices = np.arange(len(all_scores))
-    
-    while len(remaining_indices) > 0:
-        # Find the current global maximum silhouette score
-        max_idx = remaining_indices[np.argmax(all_scores[remaining_indices])]
-        max_dist = all_distances[max_idx]
-        max_clusters = all_n_clusters[max_idx]
+    optimal_thresholds_selected_distances = []
+    current_n_clusters_for_selection = -1 # Ensures the first selection considers all valid n_clusters
+
+    # Primary selection loop: Find a hierarchically optimal sequence
+    if verbose:
+        print("Selecting primary optimal thresholds...")
+    while True:
+        potential_next_cuts = [
+            cut for cut in all_cuts_info
+            if not cut['used'] and cut['n_clusters'] > current_n_clusters_for_selection
+        ]
+
+        if not potential_next_cuts:
+            break 
+
+        best_next_cut = max(potential_next_cuts, key=lambda cut: cut['score'])
         
-        # Add this threshold to our optimal set
-        optimal_thresholds.append(max_dist)
+        optimal_thresholds_selected_distances.append(best_next_cut['dist'])
+        current_n_clusters_for_selection = best_next_cut['n_clusters']
+        best_next_cut['used'] = True
+        if verbose:
+            print(f"  Selected primary level: Dist={best_next_cut['dist']:.4f}, Clusters={best_next_cut['n_clusters']}, Score={best_next_cut['score']:.4f}")
+
+    # Extension loop: If primary sequence is shorter than min_hierarchical_levels
+    num_primary_levels = len(optimal_thresholds_selected_distances)
+    if min_hierarchical_levels is not None and num_primary_levels < min_hierarchical_levels:
+        if verbose:
+            print(f"\nPrimary selection found {num_primary_levels} levels. Trying to extend to {min_hierarchical_levels} levels...")
         
-        # Remove all thresholds that have fewer clusters than the current one
-        remaining_indices = np.array([i for i in remaining_indices if all_n_clusters[i] > max_clusters])
+        num_to_add = min_hierarchical_levels - num_primary_levels
+        
+        # Get current n_clusters for all selected levels to help find gaps
+        current_selected_n_clusters = []
+        for dist in optimal_thresholds_selected_distances:
+            for cut in all_cuts_info:
+                if cut['dist'] == dist:
+                    current_selected_n_clusters.append(cut['n_clusters'])
+                    break
+        current_selected_n_clusters.sort()  # Sort to identify gaps
+        
+        for i in range(num_to_add):
+            # Find all unused cuts
+            potential_extension_cuts = [cut for cut in all_cuts_info if not cut['used']]
+            
+            if not potential_extension_cuts:
+                if verbose:
+                    print(f"  No more unused cuts available. Stopped at {len(optimal_thresholds_selected_distances)} levels.")
+                break
+            
+            # Strategy: Find the best cut that fills a gap in the hierarchy
+            # or extends it at either end
+            best_extension_cut = None
+            best_extension_score = -1
+            best_gap_size = 0
+            
+            for cut in potential_extension_cuts:
+                # Calculate gap score - how well this cut fills a gap
+                gap_score = 0
+                n_clusters = cut['n_clusters']
+                
+                # Find where this would fit in the current hierarchy
+                insert_position = None
+                for j, existing_n in enumerate(current_selected_n_clusters):
+                    if n_clusters < existing_n:
+                        insert_position = j
+                        break
+                
+                if insert_position is None:
+                    # Would go at the end (finest level)
+                    insert_position = len(current_selected_n_clusters)
+                
+                # Calculate gap size
+                if insert_position == 0:
+                    # Coarsest position
+                    if len(current_selected_n_clusters) > 0:
+                        gap_size = current_selected_n_clusters[0] - n_clusters
+                    else:
+                        gap_size = float('inf')  # First cut, infinite gap
+                elif insert_position == len(current_selected_n_clusters):
+                    # Finest position
+                    if len(current_selected_n_clusters) > 0:
+                        gap_size = n_clusters - current_selected_n_clusters[-1]
+                    else:
+                        gap_size = float('inf')  # First cut, infinite gap
+                else:
+                    # Middle position - between two existing levels
+                    gap_size = current_selected_n_clusters[insert_position] - current_selected_n_clusters[insert_position - 1]
+                
+                # Prefer cuts that fill larger gaps and have good silhouette scores
+                # Normalize gap_size to be comparable with silhouette score (0-1 range)
+                if gap_size == float('inf'):
+                    normalized_gap = 1.0
+                else:
+                    # Use a sigmoid-like function to normalize gap sizes
+                    normalized_gap = min(1.0, gap_size / 10.0)  # Assume gaps > 10 are very large
+                
+                # Combined score: weighted average of silhouette and gap filling
+                combined_score = 0.7 * cut['score'] + 0.3 * normalized_gap
+                
+                if combined_score > best_extension_score:
+                    best_extension_score = combined_score
+                    best_extension_cut = cut
+                    best_gap_size = gap_size
+            
+            if best_extension_cut:
+                optimal_thresholds_selected_distances.append(best_extension_cut['dist'])
+                best_extension_cut['used'] = True
+                
+                # Update current_selected_n_clusters to maintain sorted order
+                current_selected_n_clusters.append(best_extension_cut['n_clusters'])
+                current_selected_n_clusters.sort()
+                
+                if verbose:
+                    print(f"  Extended level {i+1}: Dist={best_extension_cut['dist']:.4f}, "
+                          f"Clusters={best_extension_cut['n_clusters']}, Score={best_extension_cut['score']:.4f}, "
+                          f"Gap filled: {best_gap_size}")
+
+    if not optimal_thresholds_selected_distances:
+         raise ValueError("No optimal thresholds could be selected. Check input data and parameters.")
+
+    # Sort the final list of selected thresholds (distances) from largest to smallest (coarse to fine)
+    optimal_thresholds = sorted(list(set(optimal_thresholds_selected_distances)), reverse=True)
     
-    optimal_thresholds = sorted(optimal_thresholds, reverse=True)
-    tree, cluster_node_ids = create_hierarchical_tree(embeddings, linkage_matrix, n_samples, optimal_thresholds, model)
     optimal_scores = []
     optimal_n_clusters = []
     for threshold in optimal_thresholds:
@@ -328,13 +455,11 @@ def optimal_hierarchical_cuts(
         'silhouette_scores': optimal_scores,
         'n_clusters': optimal_n_clusters,
         'linkage_matrix': linkage_matrix,
-        'tree': tree,
-        'cluster_node_ids': cluster_node_ids,
         'model': model  # Include the model for reference
     }
 
 
-def create_hierarchical_tree(embeddings, linkage_matrix=None, n_samples=None, distance_thresholds=None, model=None):
+def create_hierarchical_tree(embeddings, linkage_matrix=None, n_samples=None, distance_thresholds=None, model=None, examples_df=None):
     """
     Create a hierarchical tree structure with multiple levels based on optimal distance thresholds.
     
@@ -350,6 +475,8 @@ def create_hierarchical_tree(embeddings, linkage_matrix=None, n_samples=None, di
         A sorted list of distance thresholds (from largest to smallest)
     model : AgglomerativeClustering, optional
         Fitted AgglomerativeClustering model to use for more accurate tree construction
+    examples_df : pandas.DataFrame, optional
+        DataFrame containing original datapoints with cluster assignments
         
     Returns:
     --------
@@ -366,7 +493,7 @@ def create_hierarchical_tree(embeddings, linkage_matrix=None, n_samples=None, di
     
     # Add original data points as leaf nodes
     for i in range(n_samples):
-        G.add_node(i, type='sample', level='leaf', orig_node_id=i)
+        G.add_node(i, type='sample', level='leaf', orig_leaf_node_id=i)
     
     # Generate clusters at each threshold
     all_clusters = {}
@@ -453,7 +580,13 @@ def create_hierarchical_tree(embeddings, linkage_matrix=None, n_samples=None, di
                 elif G.in_degree(node) == 0:
                     G.add_edge(super_root_id, node)
     
-    return G, cluster_node_ids  
+    # Compute subtree sizes and membership for all nodes
+    print("Computing subtree sizes and membership...")
+    root_node = get_root(G)
+    compute_subtree_sizes_and_membership(G, root_node, examples_df=examples_df)
+    
+    return G, cluster_node_ids
+
 
 def run_hierarchical_clustering(
     centroids_file_path,
@@ -463,6 +596,8 @@ def run_hierarchical_clustering(
     min_cluster_size=2,
     method='ward',
     metric='euclidean',
+    examples_df=None,
+    min_hierarchical_levels=1
 ):
     """
     Perform hierarchical clustering on pre-computed centroids (from KMeans)
@@ -484,7 +619,24 @@ def run_hierarchical_clustering(
         Linkage method for hierarchical clustering
     metric : str, default='euclidean'
         Distance metric for clustering
+    examples_dataframe_path : str, optional
+        Path to the CSV file containing original datapoints with cluster assignments
+    min_hierarchical_levels : int, default=1
+        Minimum number of hierarchical levels to aim for.
     """
+    # Basic input validation
+    if not os.path.exists(centroids_file_path):
+        raise FileNotFoundError(f"Centroids file not found: {centroids_file_path}")
+    
+    if min_clusters < 2:
+        raise ValueError("min_clusters must be at least 2")
+    
+    if min_cluster_size < 2:
+        raise ValueError("min_cluster_size must be at least 2")
+    
+    if method not in ["ward", "complete", "average", "single"]:
+        raise ValueError(f"Invalid method: {method}. Must be one of: ward, complete, average, single")
+    
     # Create output directory if it doesn't exist
     os.makedirs(output_dir_path, exist_ok=True)
     
@@ -495,8 +647,24 @@ def run_hierarchical_clustering(
     except Exception as e:
         raise ValueError(f"Error loading centroids file: {e}")
     
+    # Check for NaN or infinite values in centroids
+    if np.isnan(centroids).any() or np.isinf(centroids).any():
+        raise ValueError("Centroids contain NaN or infinite values")
+    
+    # Check for zero variance features
+    zero_var_features = np.where(np.var(centroids, axis=0) == 0)[0]
+    if len(zero_var_features) > 0:
+        print(f"Warning: Found {len(zero_var_features)} features with zero variance. These may affect clustering quality.")
+    
     n_centroids = len(centroids)
     print(f"Loaded {n_centroids} centroids with dimension {centroids.shape[1]}")
+    
+    # Validate max_clusters if provided
+    if max_clusters is not None:
+        if max_clusters <= min_clusters:
+            raise ValueError(f"max_clusters ({max_clusters}) must be greater than min_clusters ({min_clusters})")
+        if max_clusters >= n_centroids:
+            raise ValueError(f"max_clusters ({max_clusters}) must be less than number of centroids ({n_centroids})")
     
     # Run hierarchical clustering
     print("Performing hierarchical clustering and finding optimal thresholds...")
@@ -508,8 +676,36 @@ def run_hierarchical_clustering(
         method=method,
         metric=metric,
         n_samples=n_centroids,
-        verbose=True
+        verbose=True,
+        min_hierarchical_levels=min_hierarchical_levels
     )
+    
+    # Validate clustering results
+    if len(result['optimal_thresholds']) < min_hierarchical_levels:
+        print(f"Warning: Found only {len(result['optimal_thresholds'])} hierarchical levels, which is less than the requested minimum of {min_hierarchical_levels}")
+    
+    # Check for degenerate clusters (clusters with size < min_cluster_size)
+    for i, threshold in enumerate(result['optimal_thresholds']):
+        cluster_labels = fcluster(result['linkage_matrix'], threshold, criterion='distance')
+        cluster_sizes = np.bincount(cluster_labels)
+        small_clusters = np.sum(cluster_sizes[1:] < min_cluster_size)
+        if small_clusters > 0:
+            print(f"Warning: Level {i+1} has {small_clusters} clusters smaller than min_cluster_size={min_cluster_size}")
+    
+    # Create the hierarchical tree after optimization
+    print("Creating hierarchical tree from optimal thresholds...")
+    tree, cluster_node_ids = create_hierarchical_tree(
+        centroids,
+        result['linkage_matrix'],
+        n_centroids,
+        result['optimal_thresholds'],
+        result['model'],
+        examples_df
+    )
+    
+    # Add the tree to the result
+    result['tree'] = tree
+    result['cluster_node_ids'] = cluster_node_ids
     
     # Save results
     output_base = Path(output_dir_path)
@@ -530,28 +726,19 @@ def run_hierarchical_clustering(
     
     # For each threshold, save cluster assignments
     linkage_m = result['linkage_matrix']
-    # This map is {(threshold, fcluster_label): graph_node_id}
-    # fcluster_label is the 1,2,3... label from fcluster for a *cluster*
-    # graph_node_id is the actual node ID in the NetworkX tree for that cluster
-    threshold_to_fcluster_to_graph_node_map = result['cluster_node_ids'] 
+    threshold_to_fcluster_to_graph_node_map = result['cluster_node_ids']
 
     for i, threshold in enumerate(result['optimal_thresholds']):
         n_clusters_at_level = result['n_clusters'][i]
         
         # Get fcluster labels for each original sample (centroid) at this threshold
-        # These labels are 1, 2, ..., n_clusters_at_level
         fcluster_labels_for_samples = fcluster(linkage_m, threshold, criterion='distance')
         
         # Map each sample's fcluster label to its corresponding graph_node_id
         graph_node_ids_for_samples = []
         for f_label in fcluster_labels_for_samples:
-            # (threshold, f_label) is the key to get the graph_node_id for the cluster this sample belongs to
             graph_node = threshold_to_fcluster_to_graph_node_map.get((threshold, f_label))
             if graph_node is None:
-                # This might happen if a threshold in optimal_thresholds wasn't used to build the cluster_node_ids map
-                # or if an fcluster_label appears that wasn't in the map for that threshold.
-                # This implies that the set of `distance_thresholds` passed to `create_hierarchical_tree`
-                # (which is `optimal_thresholds`) must be comprehensive.
                 print(f"Warning: Could not map fcluster label {f_label} at threshold {threshold} to a graph node ID. Appending None.")
                 graph_node_ids_for_samples.append(None) 
             else:
@@ -571,6 +758,128 @@ def run_hierarchical_clustering(
     return result
 
 
+def custom_examples_loader(
+        data_level_labels_path=None, 
+        examples_dataframe_path=None,
+        initial_labels_embeddings_path=None,
+        use_discretization=False,
+        experiment=None
+):
+    """
+    Load examples from a custom source. Must output a dataframe with the following columns:
+    - sentences: the text of the example
+    - label: the label of the example
+    - cluster: the cluster of the example
+    - description: the description of the example
+    """
+    def file_reader(path):
+        if '.csv' in path:
+            return pd.read_csv(path)
+        elif '.json' in path:
+            return pd.read_json(path, lines=True)
+        else:
+            raise ValueError(f"Unsupported file type: {path}")
+        
+
+    # Load discretization resources if needed
+    text_embeddings = None
+    if use_discretization:
+        if initial_labels_embeddings_path is None:
+            raise ValueError("initial_labels_embeddings_path must be provided when use_discretization is True")
+        
+        # Load the embeddings
+        print(f"Loading embeddings from: {initial_labels_embeddings_path}")
+        text_embeddings = np.load(initial_labels_embeddings_path)
+        if isinstance(text_embeddings, np.lib.npyio.NpzFile):
+            text_embeddings = text_embeddings['embeddings']
+
+    if data_level_labels_path is not None:
+        data_level_labels_df = file_reader(data_level_labels_path)
+    if examples_dataframe_path is not None:
+        examples_df = file_reader(examples_dataframe_path)
+    if data_level_labels_path is None and examples_dataframe_path is None:
+        return None
+
+    if experiment == 'news-discourse':
+        examples_df = (
+            examples_df
+                .rename(columns={'sentence': 'sentences'})
+                .assign(doc_id=lambda df: df['doc_id'].str.split('_').str.get(1).astype(int))
+                .assign(sentence_idx=lambda df: df.reset_index().groupby('doc_id')['index'].rank(method='dense').astype(int))
+         )
+        data_level_labels_df = (
+            data_level_labels_df
+                .assign(doc_id=lambda df: df['custom_id'].str.split('__').str.get(0).astype(int))
+                .drop(columns='custom_id')
+        )
+        return examples_df.drop(columns='label').merge(data_level_labels_df, on=['doc_id', 'sentence_idx']), text_embeddings
+    
+    elif experiment == 'editorial':
+        return examples_df, text_embeddings
+    
+    elif 'reasoning' in experiment:
+        data_level_labels_df = (
+            data_level_labels_df
+                .loc[lambda df: df['output'].notna()]
+                .assign(output_chunks=lambda df: df['output'].str.split(':'))
+                .assign(label=lambda df: df['output_chunks'].apply(lambda x: x[0].replace('"', '').strip()))
+                .assign(description=lambda df: df['output_chunks'].apply(lambda x: ':'.join(x[1:]).strip()))
+                .drop(columns=['output', 'output_chunks'])
+                .rename(columns={'index': 'datapoint_index'})
+        )
+
+        if examples_dataframe_path is None:
+            return data_level_labels_df.assign(sentences=np.nan), text_embeddings
+        
+        if 'response' in examples_df.columns:
+            examples_df = (
+                examples_df
+                    .explode('response')
+                    .reset_index(drop=True).reset_index()
+                    .assign(chunk_idx=lambda df:df.groupby('index')['level_0'].rank(method='dense').astype(int)-1)
+                    .assign(index=lambda df: df['index'] + '__reasoning-step-' + df['chunk_idx'].astype(str))
+                    .rename(columns={'response': 'sentences', 'index': 'datapoint_index'})
+                )
+            example_cols_to_keep = ['sentences', 'problem', 'datapoint_index']
+        else:
+            examples_df = examples_df.rename(columns={'rollouts': 'sentences', 'index': 'datapoint_index'})
+            example_cols_to_keep = ['sentences', 'datapoint_index']
+
+        output_df = (
+            data_level_labels_df
+                .merge(examples_df[example_cols_to_keep].drop_duplicates(), on='datapoint_index', how='left')
+        )
+        if '__' in experiment:
+            subsection = experiment.split('__')[1]
+            output_df = output_df.loc[lambda df: df['datapoint_index'].str.split('__').str.get(0) == subsection]
+            if use_discretization:
+                text_embeddings = text_embeddings[output_df.index.tolist()]
+            output_df = output_df.reset_index(drop=True)
+        return output_df, text_embeddings
+
+    elif experiment == 'emotions':
+        data_level_labels_df = (
+            data_level_labels_df
+                .assign(id=lambda df: df.apply(lambda x: x['custom_id'].split('__')[x['sentence_idx'] - 1], axis=1))
+        )
+        examples_df = examples_df[['text', 'id']].drop_duplicates().rename(columns={'text': 'sentences'})
+        return data_level_labels_df.merge(examples_df, on='id'), text_embeddings
+    
+    elif experiment == 'hate-speech':
+        examples_df = (
+            examples_df.assign(key= lambda df: df['Hate_ID'] + '_' + df['Reply_ID'])
+                .rename(columns={'Reply_body': 'sentences'})
+        )
+        data_level_labels_df = (
+            data_level_labels_df
+                .assign(key=lambda df: df.apply(lambda x: x['custom_id'].split('__')[x['sentence_idx'] - 1], axis=1))
+        )
+        return data_level_labels_df.merge(examples_df.drop_duplicates(subset='key'), on='key'), text_embeddings
+    else:
+        raise ValueError(f"Experiment {experiment} not supported")
+
+
+
 def label_and_visualize_tree(
     tree,
     initial_cluster_labels_path,
@@ -582,8 +891,21 @@ def label_and_visualize_tree(
     visualize=True,
     examples_metadata=None,
     use_discretization=False,
+    text_embeddings=None,
     discretization_goal="determine the common theme or purpose",
-    initial_labels_embeddings_path=None
+    # experimental variations
+    use_labels_and_descriptions=False,
+    use_descriptions_and_examples=True,
+    use_child_nodes=True,
+    output_labels_and_descriptions=False,
+    num_iterations_to_run_labeling=2,
+    labeling_model='gpt-4o-mini',
+    checking_model='gpt-4o-mini',
+    # discretization parameters
+    batch_size=30,
+    num_summary_candidates_to_generate=10,
+    num_datapoints_to_use_for_scoring=300,
+    num_leaf_samples_to_use_for_generation=30
 ):
     """
     Label and visualize a hierarchical tree.
@@ -596,8 +918,6 @@ def label_and_visualize_tree(
         Path to the CSV file containing initial cluster labels
     output_dir_path : str
         Directory to save the labeled tree and visualization
-    examples_dataframe_path : str, optional
-        Path to the CSV file containing example sentences for each cluster
     leaf_node_counts : dict, optional
         Dictionary mapping node IDs to their respective counts
     min_descendants : int, default=2
@@ -609,8 +929,8 @@ def label_and_visualize_tree(
     visualize : bool, default=True
         Whether to generate and save a visualization of the labeled tree
     examples_metadata : dictionary
-        contains keys: examples_dataframe_path, num_examples_per_node, cluster_col, sentence_col
-        * examples_dataframe_path: path to the examples dataframe
+        contains keys: examples_df, num_examples_per_node, cluster_col, sentence_col
+        * examples_df: the examples dataframe
         * num_examples_per_node: Number of example datapoints to use for each node (in addition to the labels, to keep it more specific.)
         * cluster_col: column name of the cluster column in the examples dataframe
         * sentence_col: column name of the sentence column in the examples dataframe
@@ -635,89 +955,62 @@ def label_and_visualize_tree(
     # Load initial cluster labels
     print(f"Loading initial cluster labels from: {initial_cluster_labels_path}")
     initial_labels_df = pd.read_csv(initial_cluster_labels_path)
-    
     # Ensure the labels dataframe has node_id and label columns
     if 'node_id' not in initial_labels_df.columns or 'label' not in initial_labels_df.columns:
         raise ValueError("Initial labels dataframe must have 'node_id' and 'label' columns")
     
     # Rename and process the dataframe
-    initial_labels_df = initial_labels_df.rename(columns={'node_id': 'orig_node_id'})
-    
-    # Load examples dataframe if provided
-    examples_dataframe = None
-    if examples_metadata is not None:
-        print(f"Loading examples from: {examples_metadata['examples_dataframe_path']}")
-        examples_dataframe = pd.read_csv(examples_metadata['examples_dataframe_path'])
-        if examples_metadata['cluster_col'] not in examples_dataframe.columns:
-            print("Warning: Examples dataframe does not have a 'cluster' column")
-            examples_dataframe = None
-        elif examples_metadata['sentence_col'] not in examples_dataframe.columns:
-            print("Warning: Examples dataframe does not have a 'sentence' column")
-            examples_dataframe = None
-        else:
-            print(f"Loaded {len(examples_dataframe)} examples")
+    initial_labels_df = initial_labels_df.rename(columns={'node_id': 'orig_leaf_node_id'})
     
     # Add labels to leaf nodes in the tree
     for _, row in initial_labels_df.iterrows():
-        node_id = int(row['orig_node_id'])
+        node_id = int(row['orig_leaf_node_id'])
         for n in tree.nodes():
-            if tree.nodes[n].get('orig_node_id') == node_id:
+            if tree.nodes[n].get('orig_leaf_node_id') == node_id:
                 nx.set_node_attributes(tree, {n: row['label']}, 'label')
                 break
     
-    # Generate leaf node counts if not provided
-    if leaf_node_counts is None:
-        leaf_node_counts = {}
-        for node in tree.nodes():
-            if tree.out_degree(node) == 0:  # Leaf node
-                leaf_node_counts[node] = 1
     
-    # Add size attribute to all nodes if missing. This is needed by label_hierarchical_tree to sample nodes by size
-    for node in tree.nodes():
-        if 'size' not in tree.nodes[node]:
-            if 'samples' in tree.nodes[node]:
-                nx.set_node_attributes(tree, {node: len(tree.nodes[node]['samples'])}, 'size')
-            else:
-                nx.set_node_attributes(tree, {node: 1}, 'size')
+    # Create combined texts from initial labels
+    combined_cluster_texts = initial_labels_df.apply(
+        lambda x: f"\"{x['label']}\": {x.get('description', '')}", axis=1
+    ).tolist()
     
-    # Load discretization resources if needed
-    text_embeddings = None
-    combined_cluster_texts = None
-    if use_discretization:
-        if initial_labels_embeddings_path is None:
-            raise ValueError("initial_labels_embeddings_path must be provided when use_discretization is True")
-        
-        # Load the embeddings
-        print(f"Loading embeddings from: {initial_labels_embeddings_path}")
-        text_embeddings = np.load(initial_labels_embeddings_path)
-        
-        # Create combined texts from initial labels
-        combined_cluster_texts = initial_labels_df.apply(
-            lambda x: f"\"{x['label']}\": {x.get('description', '')}", axis=1
-        ).tolist()
-        
-        print(f"Loaded {len(combined_cluster_texts)} texts and {text_embeddings.shape} embeddings for discretization")
+    print(f"Loaded {len(combined_cluster_texts)} texts for discretization")
+
     
-    # Call the label_hierarchical_tree function
-    print("Labeling hierarchical tree...")
-    labeled_tree, pruned_tree, inner_node_label_dict = label_hierarchical_tree(
-        tree,
+    # Prune the tree based on subtree sizes (which were already computed in create_hierarchical_tree)
+    print(f"Pruning tree with min_descendants={min_descendants}, max_depth={max_depth}...")
+    pruned_tree = prune_tree_by_subtree_size(tree, min_descendants=min_descendants, max_depth=max_depth)
+    
+    # Label the pruned tree
+    print("Labeling the pruned tree...")
+    labeled_tree, inner_node_label_dict = label_hierarchical_tree(
+        pruned_tree,
         leaf_node_counts=leaf_node_counts,
-        min_descendants=min_descendants,
-        max_depth=max_depth,
         num_samples_to_label=num_samples_to_label,
-        examples_dataframe=examples_dataframe,
+        examples_dataframe=examples_metadata['examples_df'],
         examples_metadata=examples_metadata,
         use_discretization=use_discretization,
         text_embeddings=text_embeddings,
         combined_cluster_texts=combined_cluster_texts,
+        # experimental variations
+        use_labels_and_descriptions=use_labels_and_descriptions,
+        use_descriptions_and_examples=use_descriptions_and_examples,
+        use_child_nodes=use_child_nodes,
+        output_labels_and_descriptions=output_labels_and_descriptions,
+        num_iterations_to_run_labeling=num_iterations_to_run_labeling,
+        labeling_model=labeling_model,
+        checking_model=checking_model,
+        # discretization parameters
+        batch_size=batch_size,
+        num_summary_candidates_to_generate=num_summary_candidates_to_generate,
+        num_datapoints_to_use_for_scoring=num_datapoints_to_use_for_scoring,
+        num_leaf_samples_to_use_for_generation=num_leaf_samples_to_use_for_generation,
         discretization_goal=discretization_goal
     )
-    
     save_hierarchical_tree(labeled_tree, labeled_tree_path)
     print(f"Saved labeled tree to: {labeled_tree_path}")
-    save_hierarchical_tree(pruned_tree, pruned_tree_path)
-    print(f"Saved pruned tree to: {pruned_tree_path}")
     
     # Save inner node labels
     inner_node_label_df = pd.DataFrame([
@@ -731,11 +1024,13 @@ def label_and_visualize_tree(
     if visualize:
         # Set up visualization parameters
         plot_path = output_base / 'labeled_tree_visualization.png'
+        
+        # Create figure with appropriate size
         plt.figure(figsize=(16, 12))
         
         # Use plot_graph function to visualize
         plot_graph(
-            pruned_tree,
+            labeled_tree,
             with_labels=True,
             with_node_id=True,
             with_sizes=True,
@@ -755,6 +1050,40 @@ def label_and_visualize_tree(
     return labeled_tree, pruned_tree, inner_node_label_dict
 
 
+def get_experiment_variant_name(args):
+    """
+    Generate a descriptive name for the experiment variant based on the flags used.
+    
+    Parameters:
+    -----------
+    args : argparse.Namespace
+        Command line arguments
+        
+    Returns:
+    --------
+    str
+        A descriptive name for the experiment variant
+    """
+    variant_parts = []
+    
+    # Add discretization variants
+    if args.use_discretization:
+        variant_parts.append("discretized")
+        if args.use_labels_and_descriptions:
+            variant_parts.append("labels_descriptions")
+        if args.use_descriptions_and_examples:
+            variant_parts.append("examples")
+        if args.use_child_nodes:
+            variant_parts.append("child-nodes")
+        if args.output_labels_and_descriptions:
+            variant_parts.append("output-labels-desc")
+    
+    # If no variants were added, return "standard"
+    if not variant_parts:
+        return "standard"
+    
+    return "__".join(variant_parts)
+
 def main():
     parser = argparse.ArgumentParser(description="Perform hierarchical clustering on KMeans centroids.")
     parser.add_argument("centroids_file", help="Path to the file containing KMeans centroids (NumPy format)")
@@ -766,66 +1095,127 @@ def main():
                         help="Linkage method for hierarchical clustering")
     parser.add_argument("--metric", default="euclidean", help="Distance metric for clustering")
     
+    # Add argument for min_hierarchical_levels
+    parser.add_argument("--min_hierarchical_levels", type=int, default=6, 
+                        help="Minimum number of hierarchical levels to aim for (default: 6)")
+
     # Add arguments for labeling and visualization
     parser.add_argument("--label_tree", action="store_true", help="Label the hierarchical tree using utils_trees functions")
-    parser.add_argument("--initial_labels", help="Path to the CSV file containing initial cluster labels")
+    parser.add_argument("--initial_cluster_labels_path", help="Path to the CSV file containing initial cluster labels")
     parser.add_argument("--min_descendants", type=int, default=2, help="Minimum descendants for tree pruning")
     parser.add_argument("--max_depth", type=int, default=8, help="Maximum depth for tree pruning")
-    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to use for labeling each inner node")
+    parser.add_argument("--num_samples_per_node_for_labeling", type=int, default=10, 
+                       help="Number of samples to use for labeling each inner node in the tree")
     parser.add_argument("--no_visualize", action="store_true", help="Skip tree visualization")
 
     # Add arguments for examples
-    parser.add_argument("--examples_df", help="Path to the CSV file containing example sentences for each cluster")
-    parser.add_argument("--num_examples_per_node", type=int, default=3, help="Number of example datapoints to use for each node (in addition to the labels, to keep it more specific.)")
-    parser.add_argument("--examples_cluster_col", type=str, default="cluster", help="Column name of the cluster column in the examples dataframe")
-    parser.add_argument("--examples_sentence_col", type=str, default="sentence", help="Column name of the sentence column in the examples dataframe")
+    parser.add_argument("--experiment", type=str, default="editorial", help="Experiment name")
+    parser.add_argument("--datapoint_level_labels_path", help="Path to the CSV file containing low-level labels for each datapoint")
+    parser.add_argument("--raw_data_examples_df_path", help="Path to the CSV file containing example sentences for each cluster")
+    parser.add_argument("--num_examples_per_node", type=int, default=10, help="Number of examples to show per node in visualization")
+    parser.add_argument("--examples_cluster_col", type=str, default="cluster", help="Column name for cluster IDs in examples_df")
+    parser.add_argument("--examples_sentence_col", type=str, default="description", help="Column name for description in examples_df")
 
     # Add arguments for discretization
     parser.add_argument("--use_discretization", action="store_true", help="Use discretization approach for labeling")
-    parser.add_argument("--discretization_goal", type=str, default="determine the common theme or purpose", help="Goal for discretization")
-    parser.add_argument("--initial_labels_embeddings", help="Path to the initial labels embeddings file (required if use_discretization is True)")
+    parser.add_argument("--discretization_goal", type=str, default="determine the common theme or purpose", 
+                       help="Goal for discretization (e.g., 'determine the argumentation strategy')")
+    parser.add_argument("--initial_datapoint_level_label_embeddings", 
+                       help="Path to the embeddings for the labels of the datapoints (required if use_discretization is True)")
+    parser.add_argument("--num_leaf_samples_to_use_for_generation", type=int, default=30,
+                       help="How many datapoints to sample for LLM prompting")
+    parser.add_argument("--num_summary_candidates_to_generate", type=int, default=10,
+                       help="How many summary candidates to generate per slot")
+    parser.add_argument("--num_datapoints_to_use_for_scoring", type=int, default=300,
+                       help="How many datapoints to sample for scoring")
+    parser.add_argument("--batch_size", type=int, default=30,
+                       help="How many summaries to score at a time")
 
+    # experimental variations
+    parser.add_argument("--use_labels_and_descriptions", action="store_true", 
+                       help="Use labels and descriptions for summary generation")
+    parser.add_argument("--use_descriptions_and_examples", action="store_true", 
+                       help="Use descriptions and examples for summary generation")
+    parser.add_argument("--use_child_nodes", action="store_true", 
+                       help="Use child nodes for summary generation")
+    parser.add_argument("--output_labels_and_descriptions", action="store_true", 
+                       help="Output labels and descriptions for summary generation")
+    parser.add_argument("--num_iterations_to_run_labeling", type=int, default=2, 
+                       help="Number of iterations to run labeling for discretization")
+    
+    # models
+    parser.add_argument("--labeling_model", type=str, default='gpt-4o-mini', help="Model to use for labeling nodes")
+    parser.add_argument("--checking_model", type=str, default='gpt-4o-mini', help="Model to use for checking labels")
     args = parser.parse_args()
+
+    # Generate descriptive output directory name
+    experiment_variant = get_experiment_variant_name(args)
+    output_dir = f"{args.output_dir}__{experiment_variant}"
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Using output directory: {output_dir}")
+
+    # Load examples dataframe if provided
+    examples_df, text_embeddings = custom_examples_loader(
+        data_level_labels_path=args.datapoint_level_labels_path,
+        examples_dataframe_path=args.raw_data_examples_df_path,
+        initial_labels_embeddings_path=args.initial_datapoint_level_label_embeddings,
+        use_discretization=args.use_discretization,
+        experiment=args.experiment
+    )
 
     # Run hierarchical clustering
     result = run_hierarchical_clustering(
         args.centroids_file,
-        args.output_dir,
+        str(output_dir),  # Convert Path to string
         min_clusters=args.min_clusters,
         max_clusters=args.max_clusters,
         min_cluster_size=args.min_cluster_size,
         method=args.method,
         metric=args.metric,
+        examples_df=examples_df,
+        min_hierarchical_levels=args.min_hierarchical_levels
     )
     
     # Label and visualize the tree if requested
     if args.label_tree:
-        if args.initial_labels is None:
-            print("Warning: No initial labels file provided. Skipping tree labeling.")
-        else:
-            # Check if discretization is enabled but embeddings are missing
-            if args.use_discretization and args.initial_labels_embeddings is None:
-                print("Warning: Discretization enabled but no embeddings file provided. Disabling discretization.")
-                args.use_discretization = False
-                
-            label_and_visualize_tree(
-                result['tree'],
-                args.initial_labels,
-                args.output_dir,
-                min_descendants=args.min_descendants,
-                max_depth=args.max_depth,
-                num_samples_to_label=args.num_samples,
-                visualize=not args.no_visualize,
-                examples_metadata={
-                    'examples_dataframe_path': args.examples_df,
-                    'num_examples_per_node': args.num_examples_per_node,
-                    'cluster_col': args.examples_cluster_col,
-                    'sentence_col': args.examples_sentence_col
-                },
-                use_discretization=args.use_discretization,
-                discretization_goal=args.discretization_goal,
-                initial_labels_embeddings_path=args.initial_labels_embeddings
-            )
+        if not args.initial_cluster_labels_path:
+            raise ValueError("Initial labels must be provided to label the tree.")
+        
+        print("Labeling and visualizing tree...")
+        label_and_visualize_tree(
+            tree=result['tree'],
+            initial_cluster_labels_path=args.initial_cluster_labels_path,
+            output_dir_path=output_dir,  # Use the new output directory
+            leaf_node_counts=result['cluster_node_ids'],
+            min_descendants=args.min_descendants,
+            max_depth=args.max_depth,
+            num_samples_to_label=args.num_samples_per_node_for_labeling,
+            visualize=(not args.no_visualize),
+            examples_metadata={
+                'examples_df': examples_df,
+                'num_examples_per_node': args.num_examples_per_node,
+                'cluster_col': args.examples_cluster_col,
+                'sentence_col': args.examples_sentence_col
+            },
+            use_discretization=args.use_discretization,
+            text_embeddings=text_embeddings,
+            discretization_goal=args.discretization_goal,
+            # experimental variations
+            use_labels_and_descriptions=args.use_labels_and_descriptions,
+            use_descriptions_and_examples=args.use_descriptions_and_examples,
+            use_child_nodes=args.use_child_nodes,
+            output_labels_and_descriptions=args.output_labels_and_descriptions,
+            num_iterations_to_run_labeling=args.num_iterations_to_run_labeling,
+            labeling_model=args.labeling_model,
+            checking_model=args.checking_model,
+            # discretization parameters
+            batch_size=args.batch_size,
+            num_summary_candidates_to_generate=args.num_summary_candidates_to_generate,
+            num_datapoints_to_use_for_scoring=args.num_datapoints_to_use_for_scoring,
+            num_leaf_samples_to_use_for_generation=args.num_leaf_samples_to_use_for_generation
+        )
 
 if __name__ == "__main__":
     main() 
@@ -868,6 +1258,10 @@ if __name__ == "__main__":
         --examples_cluster_col cluster \
         --examples_sentence_col sentences \
         --use_discretization \
+        --use_labels_and_descriptions \
+        --use_descriptions_and_examples \
+        --use_child_nodes \
+        --output_labels_and_descriptions \
         --discretization_goal "determine the argumentation strategy" \
-        --initial_labels_embeddings experiments/editorial/initial_label_embeddings_cache.npy
+        --initial_datapoint_level_label_embeddings experiments/editorial/initial_label_embeddings_cache.npy
 """

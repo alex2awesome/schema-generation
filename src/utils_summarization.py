@@ -9,8 +9,12 @@ from prompts import (
     AreSummariesInTextResponse,
     make_summary_structure,
     # Summary generation
-    GENERATE_SUMMARIES_PROMPT,
-    GenerateSummariesResponse
+    GENERATE_SUMMARIES_WITH_DESCRIPTIONS_PROMPT,
+    GENERATE_SUMMARIES_WITH_DESCRIPTIONS_AND_EXAMPLES_PROMPT,
+    GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT,
+    GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT_WITH_PRIOR_LABEL,
+    GenerateSummariesResponse,
+    GenerateSummariesWithLabelsAndDescriptionsResponse  
 )
 import numpy as np
 from utils_openai_client import prompt_openai_model
@@ -19,7 +23,10 @@ import numpy as np
 from itertools import product
 import networkx as nx
 import os
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm.auto import tqdm
+from more_itertools import unique_everseen
+
 
 def _get_sample_nodes(
     node: int, 
@@ -57,17 +64,17 @@ def _get_examples_for_one_node(
     """
     Get examples for a single node.
     """
-    orig_node_id = tree.nodes[node].get('orig_node_id')
-    if orig_node_id is not None:
-        node_examples = example_df.loc[orig_node_id][sentence_col]
+    orig_leaf_node_id = tree.nodes[node].get('orig_leaf_node_id')
+    if orig_leaf_node_id is not None:
+        node_examples = example_df.loc[orig_leaf_node_id][sentence_col]
         if isinstance(node_examples, pd.Series):
             if len(node_examples) > num_examples_per_node:
-                return node_examples.sample(num_examples_per_node).tolist()
+                node_examples = node_examples.sample(num_examples_per_node).tolist()
             else:
-                return node_examples.tolist()
+                node_examples = node_examples.tolist()
         else:
-            return [node_examples]
-    return []
+            node_examples = [node_examples]
+    return node_examples
 
 
 def summarize_labels(
@@ -128,10 +135,12 @@ def single_pass_summarize_labels_with_examples(
 
 def judge_summary_matches(
     summary_datapoint_pairs: List[Tuple[str, str]],
-    goal: str
+    goal: str,
+    model_name: str = 'gpt-4o-mini'
 ) -> List[int]:
     """
     Batched judge function that uses an LLM to determine whether each datapoint satisfies the summary.
+    For now, make the simplifying assumption that we will only be scoring label
 
     Args:
         summaries: List of length-N strings, each a summary in natural language.
@@ -155,7 +164,7 @@ def judge_summary_matches(
     prompt = ARE_SUMMARIES_IN_TEXT_PROMPT.format(k=len(summary_pairs), summary_pairs='\n\n'.join(summary_pairs), goal=goal)
     output = prompt_openai_model(
         prompt=prompt, 
-        model_name="gpt-4o-mini", 
+        model_name=model_name, 
         temperature=0.1, 
         response_format=make_summary_structure(len(summary_pairs), len(summary_pairs))
     )
@@ -163,57 +172,128 @@ def judge_summary_matches(
 
 
 def discretize_embedding_summaries(
+    node: int,
+    tree: nx.DiGraph,
     phi_tilde: np.ndarray,
-    X: List[Any],
-    text_embeddings: np.ndarray,
+    examples_df: pd.DataFrame,
+    description_embeddings: np.ndarray,
     M: int = 5,
-    num_samples_for_candidate_generation: int = 30,
+    num_leaf_samples_to_use_for_generation: int = 30,
     batch_size: int = 30,
-    num_candidates: int = 10,
-    num_samples_for_scoring: int = 300,
+    num_summary_candidates_to_generate: int = 10,
+    num_datapoints_to_use_for_scoring: int = 300,
+    # experimental variations
+    use_descriptions_and_examples: bool = False,
+    use_child_nodes: bool = False,
+    use_labels_and_descriptions: bool = False,
+    output_labels_and_descriptions: bool = False,
     goal: str = "the text is about the topic",
-    verbose: bool = False
+    verbose: bool = False,
+    checking_model: str = 'gpt-4o-mini',
+    labeling_model: str = 'gpt-4o-mini'
 ) -> List[str]:
     """
     Convert a continuous summary vector `phi_tilde` into a list of M discrete
     candidate summaries for a clustering task.
 
     Args:
+        node: The node to discretize.
+        tree: The tree structure. Used for getting children and other summaries.
         phi_tilde: Unit-norm vector of shape (d,), the continuous summary.
-        X: List of datapoints (any type) of length N.
-        embeddings: Array of shape (N, d), embedding for each datapoint.
+        examples_df: DataFrame of examples including: "label", "description" and "sentence" columns.
+        description_embeddings: Array of shape (N, d), embedding for each datapoint. Embeddings are
+            of the descriptions.
         M: Number of top summaries to return per slot.
-        num_samples_for_candidate_generation: How many datapoints to sample for LLM prompting.
+        num_leaf_samples_to_use_for_generation: How many datapoints to sample for LLM prompting.
         batch_size: How many summaries to score at a time.
-        num_candidates: How many summary candidates to generate per slot.
-        num_samples_for_scoring: How many datapoints to sample for scoring.
-        goal: The goal of the summaries.
+        num_summary_candidates_to_generate: How many summary candidates to generate per slot.
+        num_datapoints_to_use_for_scoring: How many datapoints to sample for scoring.
+        use_descriptions_and_examples: Whether to include both descriptions and example sentences
+            in the LLM prompt. When True, the prompt will include both the description and an 
+            example sentence for each sample, providing more context for summary generation.
+        use_child_nodes: Whether to incorporate information from child nodes in the tree when
+            generating summaries. When True, the LLM will consider the summaries of child nodes
+            to maintain hierarchical consistency in the generated summaries.
+        use_labels_and_descriptions: Whether to use both labels and descriptions when formatting 
+            text. When True, text will be formatted as "label: description", otherwise only the
+            label will be used.
+        output_labels_and_descriptions: Whether to output summaries in a structured format with 
+            separate label and description fields. When True, returns a list of dictionaries with
+            'label' and 'description' keys; when False, returns a list of strings.
+        goal: The goal of the summaries. To be passed into the LLM to help with generating t
+            summaries that are more aligned with the goal.
+        verbose: Whether to print progress information during processing.
+        checking_model: The model to use for checking summary matches.
+        labeling_model: The model to use for generating summaries.
 
     Returns:
         List of M symbolic summary strings that best align with `phi_tilde`.
     """
     # 1) Sample points uniformly for candidate generation
-    N, _ = text_embeddings.shape
-    full_scores = text_embeddings.dot(phi_tilde)
-    order = np.argsort(full_scores)[::-1]
-    top_N_idx = order[:int(num_samples_for_candidate_generation / 2)]
-    bottom_N_idx = order[-int(num_samples_for_candidate_generation / 2):]
-    top_N_examples, top_N_scores = [X[i] for i in top_N_idx], full_scores[top_N_idx]
-    bottom_N_examples, bottom_N_scores = [X[i] for i in bottom_N_idx], full_scores[bottom_N_idx]
+    full_scores = cosine_similarity(description_embeddings, phi_tilde.reshape(1, -1)).flatten()
+    order = np.argsort(full_scores)[::-1] # get the most similar descriptions. 
+    top_N_idx = np.random.choice(order[:num_leaf_samples_to_use_for_generation], size=int(num_leaf_samples_to_use_for_generation/2), replace=False)
+    bottom_N_idx = np.random.choice(order[-num_leaf_samples_to_use_for_generation:], size=int(num_leaf_samples_to_use_for_generation/2), replace=False)
 
-    # 4) Generate candidate summaries via LLM prompt
+    # 1.1) get the datapoints.
+    if use_labels_and_descriptions:
+        text_descriptions = examples_df.apply(lambda row: f"{row['label']}: {row['description']}", axis=1).tolist()
+    else:
+        text_descriptions = examples_df['label'].tolist()
+    text_examples = examples_df['sentences'].tolist()
+    top_N_examples, top_N_descriptions, top_N_scores = [text_examples[i] for i in top_N_idx], [text_descriptions[i] for i in top_N_idx], full_scores[top_N_idx]
+    bottom_N_examples, bottom_N_descriptions, bottom_N_scores = [text_examples[i] for i in bottom_N_idx], [text_descriptions[i] for i in bottom_N_idx], full_scores[bottom_N_idx]
+
+    # 1.2) Get children and other summaries
+    def format_summaries(node_list, use_labels_and_descriptions):
+        # helper function to format a single summary
+        def format_summary(node):
+            if 'label' in tree.nodes[node]:
+                if use_labels_and_descriptions:
+                    return f"{tree.nodes[node]['label']}: {tree.nodes[node]['description']}"
+                else:
+                    return tree.nodes[node]['label']
+        
+        # if we're only summarizing one node, return the summary for that node
+        if isinstance(node_list, int):
+            return format_summary(node_list)
+        
+        # otherwise, return the summaries for all the nodes
+        summaries = [format_summary(node) for node in node_list]
+        return list(filter(lambda x: x is not None, summaries))
+    
+    prior_label = format_summaries(node, use_labels_and_descriptions) # useful if we're doing multiple iterations of labeling
+    children_nodes = set(tree.successors(node))
+    children_summaries = format_summaries(children_nodes, use_labels_and_descriptions)
+    other_summaries = format_summaries(tree.nodes() - children_nodes - {node}, use_labels_and_descriptions)
+
+    # 2) Generate candidate summaries via LLM prompt
     candidates = generate_candidate_summaries(
         low_scoring_examples=bottom_N_examples, 
         low_scoring_scores=bottom_N_scores, 
+        low_scoring_descriptions=bottom_N_descriptions,
         high_scoring_examples=top_N_examples, 
         high_scoring_scores=top_N_scores, 
-        num_candidates=num_candidates, 
-        batch_size=5,
-        goal=goal
+        high_scoring_descriptions=top_N_descriptions,
+        num_summary_candidates_to_generate=num_summary_candidates_to_generate, 
+        batch_size=batch_size,
+        goal=goal,
+        children_summaries=children_summaries,
+        other_summaries=other_summaries,
+        prior_label=prior_label,
+        # experimental variations
+        use_descriptions_and_examples=use_descriptions_and_examples,
+        use_child_nodes=use_child_nodes,
+        output_labels_and_descriptions=output_labels_and_descriptions,
+        model_name=labeling_model
     )
 
     # Use itertools.product to create pairs of summaries and data points
-    sampled_X_for_scoring = list(map(str, np.random.choice(X, size=min(num_samples_for_scoring, len(X)), replace=False)))
+    sampled_X_for_scoring = list(map(str, np.random.choice(
+        text_descriptions, 
+        size=min(num_datapoints_to_use_for_scoring, len(text_descriptions)), 
+        replace=False
+    )))
     summary_pairs_to_score = list(product(candidates, sampled_X_for_scoring))
     all_denotations = []
     to_iter = range(0, len(summary_pairs_to_score), batch_size)
@@ -221,7 +301,7 @@ def discretize_embedding_summaries(
         to_iter = tqdm(to_iter, desc="Scoring summaries")
     for i in to_iter:
         batch_summary_pairs = summary_pairs_to_score[i: i + batch_size]
-        denotations = judge_summary_matches(batch_summary_pairs, goal)
+        denotations = judge_summary_matches(batch_summary_pairs, goal, model_name=checking_model)
         all_denotations.extend(denotations)
 
     full_df = (
@@ -232,9 +312,13 @@ def discretize_embedding_summaries(
     )
 
     # Calculate correlation for each candidate
+    candidate_groupby = 'candidate'
+    if output_labels_and_descriptions:
+        candidate_groupby = 'candidate_label'
+
     candidate_corr = (
         full_df
-            .groupby('candidate')
+            .groupby(candidate_groupby)
             .apply(
                 lambda df: np.corrcoef(df['denotation'], full_scores[:len(df)])[0, 1]
                 if df['denotation'].std() >= 1e-8 and full_scores[:len(df)].std() >= 1e-8 else 0.0
@@ -242,64 +326,110 @@ def discretize_embedding_summaries(
     )
 
     # 6) Select top-M by correlation
-    candidate_corr.sort_values(ascending=False, inplace=True)#, by='correlation')
-    top_M_summaries = candidate_corr.index.tolist()[:M]#['candidate'].tolist()[:M]
-    # top_M_summaries_df = pd.Series(candidates).loc[lambda s: s.isin(top_M_summaries)]
-    # top_M_summaries_df = pd.DataFrame(candidates).loc[lambda df: df['label'].isin(top_M_summaries)]
+    candidate_corr.sort_values(ascending=False, inplace=True)
+    top_M_summaries = candidate_corr.index.tolist()[:M]
+    if output_labels_and_descriptions:
+        top_M_summaries = [c for c in candidates if c['label'] in top_M_summaries]
     return top_M_summaries
 
 
 def generate_candidate_summaries(
     low_scoring_examples: List[Any],
     low_scoring_scores: List[float],
+    low_scoring_descriptions: List[str],
     high_scoring_examples: List[Any],
     high_scoring_scores: List[float],
-    num_candidates: int,
+    high_scoring_descriptions: List[str],
+    num_summary_candidates_to_generate: int,
     batch_size: int,
-    goal: str
+    goal: str,
+    children_summaries: List[str] = None,
+    other_summaries: List[str] = None,
+    prior_label: str = None,
+    # experimental variations
+    use_descriptions_and_examples: bool = False,
+    use_child_nodes: bool = False,
+    output_labels_and_descriptions: bool = False,
+    model_name: str = 'gpt-4o-mini'
 ) -> List[str]:
     """
-    Stub for LLM-driven summary generation.
-    Replace this with actual LLM API calls and prompt engineering.
+    LLM-driven summary generation with prompt selection based on experimental flags.
     """
-    # Sample 0. "athlete demonstrated remarkable prowess." (score: -0.2)
-    # Sample 1. "see the player?" (score: -0.3)
-    # ...
-    # Sample 9. "wonderful painting..." (score: 0.4)
-    def format_examples(score_list, example_list, negation=False):
+    def format_examples(score_list, description_list, example_list, use_examples, negation=False):
         output_list = []
-        for i, (example, score) in enumerate(zip(example_list, score_list)):
+        if example_list is None:
+            example_list = [None] * len(description_list)
+        for i, (example, score, description) in enumerate(zip(example_list, score_list, description_list)):
+            score = f"{score:.2f}"
             if negation:
-                output_list.append(f"Sample {i}. '{example}' (score: -{score})")
+                score = f"-{score}"
+            if use_examples:
+                output_list.append(f"Sample {i}. Description: {description}, Example: '{example}'. (score: {score})")
             else:
-                output_list.append(f"Sample {i}. '{example}' (score: {score})")
+                output_list.append(f"Sample {i}. Description: {description} (score: {score})")
         return '\n'.join(output_list)
 
-    low_scoring_example_str = format_examples(low_scoring_scores, low_scoring_examples, negation=True)
-    high_scoring_example_str = format_examples(high_scoring_scores, high_scoring_examples, negation=False)
-
-    prompt = GENERATE_SUMMARIES_PROMPT.format(
-        low_scoring_examples=low_scoring_example_str, 
-        high_scoring_examples=high_scoring_example_str, 
-        goal=goal,
-        num_candidates=num_candidates
+    low_scoring_example_str = format_examples(
+        low_scoring_scores, 
+        low_scoring_descriptions, 
+        low_scoring_examples, 
+        use_examples=use_descriptions_and_examples, 
+        negation=True
+    )
+    high_scoring_example_str = format_examples(
+        high_scoring_scores, 
+        high_scoring_descriptions, 
+        high_scoring_examples, 
+        use_examples=use_descriptions_and_examples, 
+        negation=False
     )
 
+    # Select prompt template
+    prompt_template = GENERATE_SUMMARIES_WITH_DESCRIPTIONS_PROMPT
+    if use_descriptions_and_examples:
+        prompt_template = GENERATE_SUMMARIES_WITH_DESCRIPTIONS_AND_EXAMPLES_PROMPT
+
+    input_dict = {
+        'low_scoring_input': low_scoring_example_str,
+        'high_scoring_input': high_scoring_example_str,
+        'goal': goal,
+        'num_candidates': num_summary_candidates_to_generate
+    }
+    # only use child nodes if we have children summaries and other summaries
+    if use_child_nodes and (len(children_summaries) > 0 or len(other_summaries) > 0): 
+        input_dict['children_summaries'] = children_summaries
+        input_dict['other_summaries'] = other_summaries
+        if prior_label is None:
+            prompt_template = GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT
+        else:
+            prompt_template = GENERATE_SUMMARIES_WITH_CHILD_NODES_PROMPT_WITH_PRIOR_LABEL
+            input_dict['prior_label_str'] = prior_label
+
+    prompt = prompt_template.format(**input_dict)
+    if output_labels_and_descriptions:
+        response_format = GenerateSummariesWithLabelsAndDescriptionsResponse
+    else:
+        response_format = GenerateSummariesResponse
+
     all_summaries = []
-    for i in range(0, num_candidates, batch_size):
+    for _ in range(0, num_summary_candidates_to_generate, batch_size):
         responses = prompt_openai_model(
             prompt=prompt,
-            model_name="gpt-4o-mini",
+            model_name=model_name,
             temperature=0.1,
-            response_format=GenerateSummariesResponse
+            response_format=response_format
         )
         responses = responses.dict()
         if 'summaries' in responses and isinstance(responses['summaries'], list):
             all_summaries.extend(responses['summaries'])
         else:
             all_summaries.append(responses['summary'])
+    
     # remove duplicates
-    all_summaries = list(set(all_summaries))
+    if output_labels_and_descriptions:
+        all_summaries = list(unique_everseen(all_summaries, key=lambda x: x['label']))
+    else:
+        all_summaries = list(set(all_summaries))
     return all_summaries
 
 
@@ -350,7 +480,7 @@ if __name__ == "__main__":
         for _, row in initial_labels_df.iterrows():
             node_id = int(row['node_id'])  # Assuming 'node_id' is the column name
             for n in tree.nodes():
-                if tree.nodes[n].get('orig_node_id') == node_id:
+                if tree.nodes[n].get('orig_leaf_node_id') == node_id:
                     nx.set_node_attributes(tree, {n: row['label']}, 'label')
                     if 'description' in row:
                         nx.set_node_attributes(tree, {n: row['description']}, 'description')
@@ -419,13 +549,14 @@ if __name__ == "__main__":
     if args.test_discretize:
         print("\nTesting discretize:")
         children_leaf_nodes = list(nx.descendants(tree, inner_node) & set(leaf_nodes))
-        children_leaf_node_ids = list(map(lambda x: tree.nodes[x]['orig_node_id'], children_leaf_nodes))
+        children_leaf_node_ids = list(map(lambda x: tree.nodes[x]['orig_leaf_node_id'], children_leaf_nodes))
         phi_tilde = cluster_embeddings[children_leaf_node_ids].mean(axis=0)
         phi_tilde = phi_tilde / np.linalg.norm(phi_tilde)
         
         top_summaries = discretize_embedding_summaries(
             phi_tilde=phi_tilde,
-            X=combined_texts,
+            text_descriptions=combined_texts,
+            text_examples=examples_df['sentences'],
             text_embeddings=label_embeddings,
             M=3,
             num_samples_for_candidate_generation=30,

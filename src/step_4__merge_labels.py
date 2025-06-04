@@ -29,6 +29,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 import logging
 import re
+import os
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(lineno)d - %(message)s",
@@ -97,13 +98,31 @@ def assign_kmeans_clusters(embs, save_path=None, kmeans=None):
     return cluster_indices
 
 
+def read_dataframe(input_data_file, experiment=None):
+    if '.json' in input_data_file:
+        df = pd.read_json(input_data_file, lines=True)
+    elif '.csv' in input_data_file:
+        df = pd.read_csv(input_data_file)
+    else:
+        raise ValueError(f"Unsupported file type: {input_data_file}")   
+    
+    if experiment is not None and 'reasoning' in experiment:
+        if '__' in experiment:
+            subsection = experiment.split('__')[1]
+            df = df.loc[lambda df: df['index'].str.split('__').str.get(0) == subsection] # this is a hack to get the correct subsection of the data
+    
+    return df
+
 
 if __name__ == "__main__":
     import  argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_data_file', type=str, required=True)
     parser.add_argument('--input_col_name', type=str, required=True)
+    parser.add_argument('--experiment', type=str, default=None)
     parser.add_argument('--trained_sbert_model_name', type=str, required=True)
+    parser.add_argument('--sbert_batch_size', type=int, default=100)
+    parser.add_argument('--datapoint_embeddings_path', type=str, default=None)
     parser.add_argument('--output_cluster_file', type=str, required=True)
     parser.add_argument('--output_data_file', type=str, required=True)
     parser.add_argument('--umap_output_file', type=str, default=None)
@@ -111,28 +130,31 @@ if __name__ == "__main__":
     # parameters for kmeans clustering
     parser.add_argument('--ncentroids', type=int, default=1024)
     parser.add_argument('--niter', type=int, default=200)
+    parser.add_argument('--kmeans_downsample_to', type=int, default=None, help='Number of samples to downsample to before K-means training')
     # umap parameters
     parser.add_argument('--umap_n_components', type=int, default=25)
     parser.add_argument('--umap_n_neighbors', type=int, default=100)
     parser.add_argument('--umap_min_dist', type=float, default=0.3)
     parser.add_argument('--skip_umap', action='store_true', help='Skip UMAP dimensionality reduction')
+    parser.add_argument('--skip_kmeans', action='store_true', help='Skip K-means clustering')
     args = parser.parse_args()
 
-    if '.json' in args.input_data_file:
-        df = pd.read_json(args.input_data_file, lines=True)
-    elif '.csv' in args.input_data_file:
-        df = pd.read_csv(args.input_data_file)
-    else:
-        raise ValueError(f"Unsupported file type: {args.input_data_file}")
+    df = read_dataframe(args.input_data_file, args.experiment)
     df = df.dropna(subset=[args.input_col_name])
     if args.n_rows_to_process is not None:
         df = df.head(args.n_rows_to_process)
 
     sbert_model = SentenceTransformer(args.trained_sbert_model_name)
-    embeddings = sbert_model.encode(df[args.input_col_name].tolist(), show_progress_bar=True)
+    embeddings = sbert_model.encode(df[args.input_col_name].tolist(), show_progress_bar=True, batch_size=args.sbert_batch_size)
 
-    if not args.skip_umap:
+    if args.datapoint_embeddings_path is not None:
+        os.makedirs(os.path.dirname(args.datapoint_embeddings_path), exist_ok=True)
+        logging.info(f"Saving datapoint embeddings to {args.datapoint_embeddings_path}")
+        np.savez_compressed(args.datapoint_embeddings_path, embeddings=embeddings)
+
+    if not args.skip_umap and args.umap_output_file is not None:
         import umap 
+        os.makedirs(os.path.dirname(args.umap_output_file), exist_ok=True)
         logging.info("performing UMAP embedding...")
         tqdm_kwds = {"file": ProgressWriter(), "disable": False }
         umap_embeddings = umap.UMAP(
@@ -147,13 +169,15 @@ if __name__ == "__main__":
     else:
         logging.info("Skipping UMAP embedding...")
 
-    # todo: change this to use UMAP + HDBSCAN
-    logging.info("performing K-means clustering...")
-    kmeans = train_kmeans_clustering(embeddings, ncentroids=args.ncentroids, niter=args.niter, save_path=args.output_cluster_file)
-    clusters = assign_kmeans_clusters(embeddings, kmeans=kmeans)
-
-    df["cluster"] = clusters
-    df.to_csv(args.output_data_file, index=False)
+    if not args.skip_kmeans and args.output_cluster_file is not None:
+        os.makedirs(os.path.dirname(args.output_cluster_file), exist_ok=True)
+        logging.info("performing K-means clustering...")
+        kmeans = train_kmeans_clustering(embeddings, ncentroids=args.ncentroids, niter=args.niter, save_path=args.output_cluster_file, downsample_to=args.kmeans_downsample_to)
+        clusters = assign_kmeans_clusters(embeddings, kmeans=kmeans)
+        df["cluster"] = clusters
+        df.to_csv(args.output_data_file, index=False)
+    else:
+        logging.info("Skipping K-means clustering...")
 
 """
 
@@ -171,6 +195,16 @@ python src/merge_labels.py \
     --trained_sbert_model_name experiments/editorial/models/editorial-sentence-similarity-model/trained-model \
     --output_cluster_file experiments/editorial/models/cluster_centroids.npy \
     --output_data_file experiments/editorial/models/all_extracted_discourse_with_clusters.csv \
+    --skip_umap \
+    --ncentroids 512
+
+python src/step_4__merge_labels.py \
+    --input_data_file experiments/reasoning/qwq-32b/clusters/nodes_with_preliminary_clusters.csv.gz \
+    --input_col_name output \
+    --datapoint_embeddings_path experiments/reasoning/qwq-32b/clusters/datapoint_embeddings.npz \
+    --trained_sbert_model_name experiments/reasoning/qwq-32b/models/sentence-similarity-model/trained-model \
+    --output_cluster_file experiments/reasoning/qwq-32b/clusters/preliminary_clusters.npy \
+    --output_data_file experiments/reasoning/qwq-32b/clusters/nodes_with_preliminary_clusters_with_clusters.csv \
     --skip_umap \
     --ncentroids 512
 """
