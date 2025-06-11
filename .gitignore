@@ -3,6 +3,7 @@
 .env.*
 
 # Python
+*__pycache__/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -63,7 +64,8 @@ raw_data/
 processed_data/
 output/
 results/
-experiments/
+*checkpoints/
+experiments/news-discourse/models/news-discourse-sentence-similarity-model
 
 # Logs and temporary files
 *.log
@@ -72,6 +74,8 @@ tmp/
 temp/
 .tmp/
 .temp/
+*.npy
+*.npz
 
 # IDE specific files
 .idea/
@@ -80,6 +84,7 @@ temp/
 *.swo
 .DS_Store
 Thumbs.db
+*checkpoint*
 
 # Jupyter Notebook
 .ipynb_checkpoints
