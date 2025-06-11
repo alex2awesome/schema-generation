@@ -17,6 +17,8 @@ from vllm.sampling_params import GuidedDecodingParams
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 
 _model = None
 _tokenizer = None
@@ -64,51 +66,44 @@ def run_vllm_batch(
     temp_dir=None, 
     batch_type="similarity",
     response_format=None,
+    verbose=False,
 ):
     try:
         if sampling_params is None:
             sampling_params = SamplingParams(temperature=0.1, max_tokens=4096)
-            if response_format is not None:
-                json_schema = response_format.model_json_schema()
-                guided_decoding_params = GuidedDecodingParams(json=json_schema)
-                sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
+        if response_format is not None:
+            guided_decoding_params = GuidedDecodingParams(json=response_format.model_json_schema())
+            sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
 
         tokenizer, model = load_model(model_name)
         if include_system_prompt:
             prompt_dicts = list(map(lambda x: [
-                {
-                    "role": "system",
-                    "content": "You are an experienced analyst.",
-                },
-                {
-                    "role": "user",
-                    "content": x,
-                },
+                { "role": "system", "content": "You are an experienced analyst.", },
+                { "role": "user", "content": x, },
             ], prompts))
         else:
             prompt_dicts = list(map(lambda x: [
-                {
-                    "role": "user",
-                    "content": x,
-                },
+                { "role": "user", "content": x, },
             ], prompts))
             
         formatted_prompts = list(map(lambda x: 
-            tokenizer.apply_chat_template(x, tokenize=False, add_generation_prompt=True), 
-            prompt_dicts
+            tokenizer.apply_chat_template(x, tokenize=False, add_generation_prompt=True), prompt_dicts
         ))
 
         # Process in smaller batches to manage memory
         all_results = []
         for i in range(0, len(formatted_prompts), batch_size):
             batch_prompts = formatted_prompts[i:i + batch_size]
-            batch_results = model.generate(batch_prompts, sampling_params=sampling_params)
+            batch_results = model.generate(batch_prompts, sampling_params=sampling_params, use_tqdm=verbose)
             all_results.extend(batch_results)
             # Clear CUDA cache after each batch
             torch.cuda.empty_cache()
 
         sorted_results = sorted(all_results, key=lambda x: int(x.request_id))
-        text_results = list(map(lambda x: x.outputs[0].text, sorted_results))
+        if response_format is not None:
+            text_results = list(map(lambda x: json.loads(x.outputs[0].text), sorted_results))
+        else:
+            text_results = list(map(lambda x: x.outputs[0].text, sorted_results))
         return text_results
     except Exception as e:
         logging.error(f"Error in run_vllm_batch: {str(e)}")

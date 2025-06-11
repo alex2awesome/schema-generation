@@ -337,6 +337,7 @@ class MultiSentenceLabelingItem(BaseModel):
 class MultiSentenceLabelingResponse(BaseModel):
     """Response format for multi-sentence editorial labeling."""
     sentences: List[MultiSentenceLabelingItem]
+    justifications: List[str]
 
 
 SINGLE_COMMENT_EMOTION_LABELING_PROMPT = """
@@ -397,17 +398,20 @@ class SingleCommentLabel(BaseModel):
 class SingleCommentLabelingResponse(BaseModel):
     """Response format for single comment emotion labeling."""
     comment_labels: List[SingleCommentLabel]
+    justification: str
 
 
 class MultiCommentLabelingItem(BaseModel):
     """Individual comment labeling in multi-comment response."""
     comment_idx: int
     comment_labels: List[SingleCommentLabel]
+    justifications: List[str]
 
 
 class MultiCommentLabelingResponse(BaseModel):
     """Response format for multi-comment emotion labeling."""
     comments: List[MultiCommentLabelingItem]
+    description: str
 
 
 class SimilarityPrompt(BaseModel):
@@ -423,11 +427,13 @@ class SimilarityResponse(BaseModel):
     """Response format for similarity task."""
     pair_idx: int
     label: Literal['Yes', 'No']
+    description: str
 
 
 class MultiSimilarityResponse(BaseModel):
     """Response format for multi-sentence similarity labeling."""
     pairs: List[SimilarityResponse]
+    descriptions: str
 
 
 HATE_SPEECH_LABELING_PROMPT = """
@@ -457,12 +463,14 @@ class HateSpeechLabel(BaseModel):
 class HateSpeechLabelingResponse(BaseModel):
     """Response format for hate speech labeling."""
     labels: List[HateSpeechLabel]
+    justifications: List[str]
 
 
 class MultiHateSpeechLabelingItem(BaseModel):
     """Individual hate speech labeling in multi-comment response."""
     comment_idx: int
     labels: List[HateSpeechLabel]
+    justifications: str
 
 
 class MultiHateSpeechLabelingResponse(BaseModel):
@@ -499,6 +507,7 @@ class NewsDiscourseLabel(BaseModel):
 class NewsDiscourseLabelingResponse(BaseModel):
     """Response format for news discourse labeling."""
     sentences: List[NewsDiscourseLabel]
+    justifications: str
 
 
 class MultiNewsDiscourseLabelingItem(BaseModel):
@@ -511,6 +520,7 @@ class MultiNewsDiscourseLabelingItem(BaseModel):
 class MultiNewsDiscourseLabelingResponse(BaseModel):
     """Response format for multi-news discourse labeling."""
     sentences: List[MultiNewsDiscourseLabelingItem]
+    justifications: List[str]
 
 
 # Tree Generation Prompts
@@ -616,7 +626,8 @@ from pydantic import create_model
 def make_summary_structure(min_len: int, max_len: int):
     return create_model(
         'AreSummariesInTextResponse',
-        responses=(Annotated[list[int], Len(min_length=min_len, max_length=max_len)], ...)
+        responses=(Annotated[list[int], Len(min_length=min_len, max_length=max_len)], ...),
+        justifications=str,
     )
 
 
@@ -729,7 +740,9 @@ Return just the summaries, no other text. Your response is:
 class GenerateSummariesResponse(BaseModel):
     """Response format for generate summaries task."""
     summaries: List[str]
+    justifications: List[str]
 
 class GenerateSummariesWithLabelsAndDescriptionsResponse(BaseModel):
     """Response format for generate summaries task."""
     summaries: List[TreeNodeLabelResponse]
+    justifications: List[str]
