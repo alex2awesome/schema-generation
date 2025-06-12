@@ -37,7 +37,7 @@ All outputs are saved to the directory specified by `--cache_dir` (default: 'cac
 - **Examples Cache**: Few-shot examples are selected via an LLM for crafting the lower-level prompts
   and getting the LLM to reason via a certain approach. To speed up subsequent runs, the examples 
   are cached in a `.pkl` file.
-  Filename format: `examples_cache_level_{level}.pkl`
+  Filename format: `examples_cache_level_{level}_n_{num_icl_examples}.pkl`
 
 - **Log File**: A log file named `hierarchical_reasoning.log` is created in the script's
   directory, capturing the execution flow and any warnings or errors.
@@ -85,6 +85,13 @@ import os
 import sys
 import logging
 from pathlib import Path
+import random
+
+# Add project root to path to allow absolute imports
+here = Path(__file__).parent.resolve()
+project_root = here.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from typing import Dict, List, Any, Optional
 import pickle
 from tqdm.auto import tqdm
@@ -105,22 +112,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Add src to path
-here = Path(__file__).parent
-sys.path.append(str(here.parent.parent.parent / 'src'))
+sys.path.append(str(project_root / 'src'))
 import utils_trees
 
 
 # Import prompts and LLM interface
 from reasoning_prompts import (
     CHOOSE_EXAMPLES_PROMPT,
-    FOLLOW_HIGH_LEVEL_START,
-    FOLLOW_HIGH_LEVEL_CONTINUATION,
-    FOLLOW_HIGH_LEVEL_FINAL,
-    CHOOSE_FIRST_NODE,
-    CHOOSE_NEXT_NODE,
+    LOW_LEVEL_THINKING_START,
+    LOW_LEVEL_THINKING_CONTINUATION,
+    LOW_LEVEL_THINKING_FINAL,
+    CHOOSE_FIRST_THOUGHT_TYPE,
+    CHOOSE_NEXT_THOUGHT_TYPE,
     VANILLA_BASELINE,
     make_labeling_structure,
-    BestExamples
+    make_best_examples_structure
 )
 
 
@@ -134,10 +140,13 @@ class HierarchicalReasoner:
         self.use_hierarchical = not args.vanilla_baseline
         self.cache_dir = Path(args.cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self.num_icl_examples = args.num_icl_examples
         
         # Initialize LLM interface
         self.llm_framework = args.llm_framework
-        self.model_name = args.model_name
+        self.model_name = args.model_name # main LLM
+        self.high_level_llm_framework = args.high_level_llm_framework
+        self.high_level_model_name = args.high_level_model_name # high-level LLM
         self.temperature = args.temperature
         self.vllm_base_url = args.vllm_base_url
         self.vllm_gpus = args.vllm_gpus
@@ -155,12 +164,24 @@ class HierarchicalReasoner:
             vllm_auto_start=self.vllm_auto_start, # only needed for vllm
             verbose=self.vllm_verbose
         )
+        if self.model_name == self.high_level_model_name: # if the model is the same for high and low level, use the same LLM
+            self.high_level_llm = self.llm
+        else:
+            self.high_level_llm = get_llm_interface(
+                llm_framework=self.high_level_llm_framework,
+                model_name=self.high_level_model_name,
+                temperature=self.temperature,
+                vllm_base_url=self.vllm_base_url, # only needed for vllm
+                vllm_gpus=self.vllm_gpus, # only needed for vllm,
+                vllm_auto_start=self.vllm_auto_start, # only needed for vllm
+                verbose=self.vllm_verbose
+            )
         
         # Load data
         self._load_data()
         
         # Setup examples cache
-        self.examples_cache_file = self.cache_dir / f"examples_cache_level_{self.label_level}.pkl"
+        self.examples_cache_file = self.cache_dir / f"examples_cache_level_{self.label_level}_n_{self.num_icl_examples}.pkl"
         self.examples_cache = self._load_examples_cache()
         
         # Results storage
@@ -233,9 +254,11 @@ class HierarchicalReasoner:
             return []
         
         # Sample examples for choosing best ones
-        sampled_examples = examples.sample(min(20, len(examples))).tolist()
+        sampled_examples = examples.sample(min(30, len(examples))).tolist()
         examples_text = '\n\n'.join(sampled_examples)
-        
+
+        num_to_select = self.num_icl_examples * 3
+
         # Get label description
         label_description = (
             self.labels_and_descriptions
@@ -246,17 +269,21 @@ class HierarchicalReasoner:
         
         if len(label_description) == 0:
             logger.warning(f"No description found for {thought_pattern}")
-            return sampled_examples[:5]
+            return sampled_examples[:num_to_select]
         
         label_description = label_description.iloc[0]
         
         # Choose best examples using LLM
-        prompt = self._get_choose_examples_prompt(label_description, examples_text)
+        prompt = CHOOSE_EXAMPLES_PROMPT.format(
+            thought_pattern=label_description,
+            examples=examples_text,
+            num_examples=num_to_select
+        )
         try:
-            response = self.llm(
-                model_name=self.model_name,
+            response = self.high_level_llm(
+                model_name=self.high_level_model_name,
                 prompt=prompt,
-                response_format=BestExamples
+                response_format=make_best_examples_structure(num_examples=num_to_select)
             )
             
             # Handle both structured and unstructured responses
@@ -265,22 +292,15 @@ class HierarchicalReasoner:
             else:
                 logger.warning("Structured output failed for BestExamples, using string response fallback")
                 # Try to parse the string response manually
-                best_examples = sampled_examples[:5]  # Fallback to first 5
+                best_examples = sampled_examples[:num_to_select]  # Fallback to first 5
                 
         except Exception as e:
             logger.error(f"Error choosing examples for {thought_pattern}: {e}")
-            best_examples = sampled_examples[:5]
+            best_examples = sampled_examples[:num_to_select]
         
         # Cache the result
         self.examples_cache[thought_pattern] = best_examples
         return best_examples
-    
-    def _get_choose_examples_prompt(self, thought_pattern: str, examples: str) -> str:
-        """Format prompt for choosing best examples"""
-        return CHOOSE_EXAMPLES_PROMPT.format(
-            thought_pattern=thought_pattern,
-            examples=examples
-        )
     
     def _setup_reasoning_options(self):
         """Setup the reasoning options for the current level.
@@ -322,11 +342,11 @@ class HierarchicalReasoner:
     def _get_prompts(self):
         """Get all the prompt templates"""
         return {
-            'follow_high_level_start': FOLLOW_HIGH_LEVEL_START,
-            'follow_high_level_continuation': FOLLOW_HIGH_LEVEL_CONTINUATION,
-            'follow_high_level_final': FOLLOW_HIGH_LEVEL_FINAL,
-            'choose_first_node': CHOOSE_FIRST_NODE,
-            'choose_next_node': CHOOSE_NEXT_NODE,
+            'low_level_thinking_start': LOW_LEVEL_THINKING_START,
+            'low_level_thinking_continuation': LOW_LEVEL_THINKING_CONTINUATION,
+            'low_level_thinking_final': LOW_LEVEL_THINKING_FINAL,
+            'choose_first_thought_type': CHOOSE_FIRST_THOUGHT_TYPE,
+            'choose_next_thought_type': CHOOSE_NEXT_THOUGHT_TYPE,
             'vanilla_baseline': VANILLA_BASELINE
         }
     
@@ -367,8 +387,8 @@ class HierarchicalReasoner:
             return False, ground_truth
 
         # Normalize both answers for comparison
-        response = self.llm(
-            model_name=self.model_name,
+        response = self.high_level_llm(
+            model_name=self.high_level_model_name,
             prompt=f"""Is the following answer equivalent to the ground truth(s) for {self.args.ground_truth_format}? Answer with "yes" or "no".
             Predicted: {predicted_answer}
             Ground: {ground_truth}
@@ -411,16 +431,15 @@ class HierarchicalReasoner:
         
         # Create label choices format
         label_choices_format = make_labeling_structure(reasoning_options['label'].tolist())
-        next_move_options = '\n'.join(reasoning_options['formatted_description'].sample(frac=1))
         
         all_thoughts = []
         thought_types = []
         
         try:
             # Get first thought type
-            starting_prompt = prompts['choose_first_node'].format(
+            starting_prompt = prompts['choose_first_thought_type'].format(
                 problem=problem, 
-                options=next_move_options
+                options='\n'.join(reasoning_options['formatted_description'].sample(frac=1))
             )
             
             if self.prompt_verbose and self.is_first_problem:
@@ -450,13 +469,17 @@ class HierarchicalReasoner:
 
             # Get examples and formatted description for first thought type
             option_row = reasoning_options.loc[lambda df: df['label'] == next_thought_type].iloc[0]
-            examples = option_row['examples']
+            superset_examples = option_row['examples']
+            if superset_examples and len(superset_examples) > self.num_icl_examples:
+                examples_to_show = random.sample(superset_examples, self.num_icl_examples)
+            else:
+                examples_to_show = superset_examples
             formatted_desc = option_row['formatted_description']
             
-            starting_low_level_prompt = prompts['follow_high_level_start'].format(
+            starting_low_level_prompt = prompts['low_level_thinking_start'].format(
                 problem=problem,
                 approach=formatted_desc,
-                approach_examples='\n\n'.join(examples) if examples else ''
+                approach_examples='\n\n'.join(examples_to_show) if examples_to_show else ''
             )
             
             if self.prompt_verbose and self.is_first_problem:
@@ -483,10 +506,10 @@ class HierarchicalReasoner:
                         for thought_type, thought in zip(thought_types, all_thoughts)
                     ]
                     
-                    next_thought_type_prompt = prompts['choose_next_node'].format(
+                    next_thought_type_prompt = prompts['choose_next_thought_type'].format(
                         problem=problem,
                         thinking='\n'.join(thought_format),
-                        options=next_move_options
+                        options='\n'.join(reasoning_options['formatted_description'].sample(frac=1))
                     )
                     
                     if self.prompt_verbose and self.is_first_problem:
@@ -517,22 +540,29 @@ class HierarchicalReasoner:
                 
                 # Get examples and formatted description for next thought type
                 option_row = reasoning_options.loc[lambda df: df['label'] == next_thought_type].iloc[0]
-                examples = option_row['examples']
+                superset_examples = option_row['examples']
+                if superset_examples and len(superset_examples) > self.num_icl_examples:
+                    examples_to_show = random.sample(superset_examples, min(self.num_icl_examples, len(superset_examples)))
+                else:
+                    examples_to_show = superset_examples
                 formatted_desc = option_row['formatted_description']
                 
                 # Choose prompt type based on whether we're finishing
                 if next_thought_type == 'Finish thinking':
                     if self.args.thinking_verbose:
                         logging.info(f"Finishing thinking for {problem}...")
-                    continuation_prompt = prompts['follow_high_level_final']
-                    next_low_level_prompt = continuation_prompt.format(problem=problem, thinking=thoughts)
-                else:
-                    continuation_prompt = prompts['follow_high_level_continuation']
+                    continuation_prompt = prompts['low_level_thinking_final']
                     next_low_level_prompt = continuation_prompt.format(
                         problem=problem,
-                        thinking=thoughts,
+                        thinking='\n'.join(thought_format),
+                    )
+                else:
+                    continuation_prompt = prompts['low_level_thinking_continuation']
+                    next_low_level_prompt = continuation_prompt.format(
+                        problem=problem,
+                        thinking='\n'.join(thought_format),
                         approach=formatted_desc,
-                        approach_examples='\n\n'.join(examples) if examples else ''
+                        approach_examples='\n\n'.join(examples_to_show) if examples_to_show else ''
                     )
                 
                 if self.prompt_verbose and self.is_first_problem:
@@ -602,7 +632,7 @@ class HierarchicalReasoner:
     
     def run_all_examples(self):
         """Run reasoning on all specified examples"""
-        logger.info(f"Running reasoning on {self.args.n_rows} examples...")
+        logger.info(f"Running reasoning on {self.args.n_rows} data points...")
         logger.info(f"Using hierarchical: {self.use_hierarchical}")
         if self.use_hierarchical:
             logger.info(f"Label level: {self.label_level}")
@@ -743,9 +773,16 @@ def main():
         "--model_name",
         type=str,
         default="gpt-4o-mini",
-        help="Model to use for reasoning"
+        help="Model to use for main process."
     )
-    
+
+    parser.add_argument(
+        "--high_level_model_name",
+        type=str,
+        default="gpt-4o",
+        help="Model to use for non-central tasks where we need precision (specifically, choosing examples, validating answers)."
+    )
+
     parser.add_argument(
         "--temperature",
         type=float,
@@ -760,6 +797,14 @@ def main():
         default="openai",
         choices=["openai", "vllm", "together"],
         help="LLM framework to use"
+    )
+
+    parser.add_argument(
+        "--high_level_llm_framework",
+        type=str,
+        default="openai",
+        choices=["openai", "vllm", "together"],
+        help="LLM framework to use for high-level reasoning"
     )
     
     parser.add_argument(
@@ -814,6 +859,13 @@ def main():
         type=str,
         default=os.path.join(here, "cache"),
         help="Directory for caching results and examples"
+    )
+    
+    parser.add_argument(
+        "--num_icl_examples",
+        type=int,
+        default=5,
+        help="Number of in-context examples to use in prompts. A superset of twice this number will be selected by the LLM."
     )
     
     args = parser.parse_args()

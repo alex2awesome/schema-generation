@@ -66,6 +66,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any
 from dataclasses import dataclass
+import sys
 
 import pandas as pd
 import torch
@@ -75,6 +76,31 @@ from transformers import (
     AutoModelForCausalLM,
     get_linear_schedule_with_warmup,
 )
+
+# Add project root to path to allow absolute imports
+here = Path(__file__).parent.resolve()
+project_root = here.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from llm_interface import get_llm_interface
+from reasoning_prompts import (
+    CHOOSE_FIRST_NODE,
+    CHOOSE_NEXT_NODE,
+    FOLLOW_HIGH_LEVEL_START,
+    FOLLOW_HIGH_LEVEL_CONTINUATION,
+    FOLLOW_HIGH_LEVEL_FINAL,
+)
+
+# Add src to path
+sys.path.append(str(project_root / 'src'))
+import utils_trees
+from models.grpo_utils.grpo import GRPOLoss
+from models.grpo_utils.policy import ActorCriticPolicy
+from models.grpo_utils.trainer import GRPOTrainer, GRPOTrainerConfig
+from models.grpo_utils.reward import get_reward_function
+from models.grpo_utils.sampler import RolloutSampler, RolloutBuffer
+from models.grpo_utils.dataset import GRPOCollator, GRPODataset
+from data_processing.load_and_process_data import load_and_process_data
 
 # Configure logging
 logging.basicConfig(
